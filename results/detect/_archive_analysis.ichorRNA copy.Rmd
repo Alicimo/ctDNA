@@ -1,0 +1,2074 @@
+---
+title: 'DETECT: ichorCNA on sWG'
+author: "Alistair Martin"
+date: '`r format(Sys.time(), "Last modified: %d %b %Y")`'
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+  html_notebook:
+    toc: yes
+    toc_float: yes
+layout: page
+---
+
+# Load/generate data
+
+## Set up
+
+```{r 'setup', message=FALSE, warning=FALSE}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+
+knitr::opts_chunk$set(fig.path = paste0(project.dir,"results/detect/"), dev=c('png', 'pdf'))
+
+pkgs <- c("data.table","ggplot2","ggthemes","GGally","ggbio","gridExtra","ichorCNA","GenomicRanges","survival","survminer",
+          "org.Hs.eg.db","TxDb.Hsapiens.UCSC.hg19.knownGene","BSgenome.Hsapiens.UCSC.hg19")
+pkgs <- lapply(pkgs,function(pkg) suppressWarnings(suppressMessages(require(pkg, ch = TRUE))))
+                                  
+source(paste0(project.dir,"src/ichorCNA.wrapper.R"))
+source(paste0(project.dir,"src/ABSOLUTE.wrapper.R"))
+source(paste0(project.dir,"src/load.detect.R"))
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Org.Db <- org.Hs.eg.db
+
+detect <- detect.load(project.dir)
+detect$sWG.normed <- normalise.ichorCNA(detect$sWG,which(detect$sWG.meta[,Sample.type=="BC"]))
+```
+
+## Run IchorCNA
+
+### Run IchorCNA (default)
+
+```{r}
+ichor.dir <- paste0(project.dir,"data/ichorCNA/detect/")
+env.vars <- get.default.env.vars.ichorCNA()
+x <- run.ichor.pipeline(detect$sWG.normed$cns,env.vars,ichor.dir,verbose = F)
+detect$ichorCNA.summary <- x$summary
+detect$ichorCNA.bestModels <- x$bestModels
+rm(x)
+```
+
+### Run IchorCNA (low tumour content)
+
+```{r}
+ichor.dir <- paste0(project.dir,"data/ichorCNA/detect.lowTumFrac/")
+
+env.vars <- get.default.env.vars.ichorCNA()
+env.vars$normal <- c(0.95, 0.99, 0.995, 0.999)
+env.vars$ploidy <- c(2)
+env.vars$estimateScPrevalence <- FALSE
+env.vars$scStates <- integer()
+
+x <- run.ichor.pipeline(detect$sWG.normed$cns,env.vars,ichor.dir,verbose = F)
+detect$ichorCNA.summary.low <- x$summary
+detect$ichorCNA.bestModels.low <- x$bestModels
+rm(x)
+```
+
+### Take best models (by LL) of both ichorCNA modes
+
+```{r}
+x <- lapply(1:nrow(detect$ichorCNA.summary),function(i){
+  if(detect$ichorCNA.summary[i,loglik] > detect$ichorCNA.summary.low[i,loglik]){
+    return(list(
+      summary=detect$ichorCNA.summary[i],
+      model=detect$ichorCNA.bestModels[[i]]
+    ))
+  } else {
+    return(list(
+      summary=detect$ichorCNA.summary.low[i],
+      model=detect$ichorCNA.bestModels.low[[i]]
+    ))
+  }
+})
+
+detect$ichorCNA.summary.default <- detect$ichorCNA.summary
+detect$ichorCNA.summary <- rbindlist(lapply(x,'[[','summary'))
+
+detect$ichorCNA.bestModels <- NULL
+detect$ichorCNA.bestModels.low <- NULL
+rm(x)
+```
+
+## Run ABSOLUTE
+
+```{r}
+absolute.dir <- paste0(project.dir,'data/ABSOLUTE/detect/')
+dir.create(absolute.dir,showWarnings=F)
+x <- run.absolute.pipeline(detect$sWG$segments,absolute.dir)
+detect$absolute <- merge(detect$sWG.meta,x,all.x=T,sort=F)
+```
+
+## Calculate Z.OR Score
+
+```{r}
+x <-  cbind(detect$sWG$cns[,1:4,with=F],apply(detect$sWG$cns[,-(1:4)],2,function(y){y[y < -2] <- NA; y}))
+
+i <- which(detect$sWG.meta[,Sample.type=="BC"])
+s.OR <- apply(x[,i+4,with=F],1,function(y){sd(y,na.rm=T)})
+u.OR  <- rowSums(x[,i+4,with=F],na.rm=T) / length(i)
+
+detect$z.OR <- cbind(
+  detect$sWG.meta,
+    z.OR=x[,sapply(.SD[,-(1:4)],function(y){mean(abs((as.numeric(y)-u.OR)/s.OR),na.rm=T)})]
+)
+```
+
+## Calculate tMAD Score (slightly wrong)
+
+```{r}
+x <-  cbind(detect$sWG$segments[,1:4,with=F],apply(detect$sWG$segments[,-(1:4)],2,function(y){y[y < -2] <- NA; y}))
+
+detect$t.MAD <- cbind(
+  detect$sWG.meta,
+  t.MAD=x[,sapply(.SD[,-(1:4)],function(y){mean(abs(y),na.rm=T)})]
+)
+```
+
+## Custom measure(s)
+
+```{r,eval=F}
+p.IDs <- unique(detect$ichorCNA.summary[Sample.type=="PT",Patient.ID])
+x <- rbindlist(lapply(p.IDs, function(p.ID){
+  PT.IDs <- detect$ichorCNA.summary[,which(Patient.ID==p.ID & Sample.type=="PT")]
+  PT.ID <- PT.IDs[ detect$ichorCNA.summary[PT.IDs][,which.max(Mapped.reads)]  ]
+  sample.IDs <- detect$ichorCNA.summary[,which(Patient.ID==p.ID)]
+  
+  if(detect$ichorCNA.summary[PT.ID,n_est!=1]) {
+    PT.clonal.segs <- data.table(detect$ichorCNA.bestModels[[PT.ID]]$results$segs[[1]])[(copy.number != 2) & subclone.status == F]
+    PT.subclonal.segs <- data.table(detect$ichorCNA.bestModels[[PT.ID]]$results$segs[[1]])[(copy.number != 2) & subclone.status == T]
+    x <- lapply(sample.IDs, function(sample.ID){
+      sample.cns <- detect$sWG$cns[,c(1:4,sample.ID+4),with=F]
+      x.clonal <- median(unlist(by(PT.clonal.segs, 1:nrow(PT.clonal.segs), function(seg){
+         sample.cns[chromosome==seg$chr & start>=seg$start & end <= seg$end,5] / seg$median
+      })))
+      #x.subclonal <- median(unlist(by(PT.subclonal.segs, 1:nrow(PT.subclonal.segs), function(seg){
+      #   sample.cns[chromosome==seg$chr & start>=seg$start & end <= seg$end,5] / seg$median
+      #})))
+      #list(clonal=x.clonal,subclonal=x.subclonal)
+      list(clonal=x.clonal)
+    })
+    x <- unlist(lapply(x, "[[", "clonal"))
+  } else {
+    x <- NA
+  }
+  x <- data.table(Sample.name=detect$ichorCNA.summary[sample.IDs,Sample.name], tumour.frac=x * detect$ichorCNA.summary[PT.ID,(1-n_est)])
+  return(x)
+}))
+detect$custom.carlos <- merge(detect$sWG.meta,x,all.x=T,sort=F)
+```
+
+# Overview on sampling
+
+## Timelines
+
+```{r}
+x <- unique(detect$RECIST[,.(sample.date=as.Date(date,"%d/%m/%y")),patient.ID])
+x <- x[,.(first.date.CT=min(sample.date,na.rm=T),last.date.CT=max(sample.date,na.rm=T)),patient.ID]
+
+y <- unique(detect$sWG.meta[Sample.type=="ctDNA",.(sample.date=as.Date(Date.collected)),.(patient.ID=Patient.ID)])
+y <- y[,.(first.date.BL=min(sample.date,na.rm=T),last.date.BL=max(sample.date,na.rm=T)),patient.ID]
+
+x <- merge(x,y)
+x <- x[,.(first.date=min(first.date.BL,first.date.CT,na.rm=T),last.date=max(last.date.BL,last.date.CT,na.rm=T)),patient.ID]
+
+y <- rbind(
+  unique(detect$RECIST[,.(sample.date=as.Date(date,"%d/%m/%y"),patient.ID,sample.type="CT scan")]),
+  unique(detect$sWG.meta[,.(sample.date=as.Date(Date.collected),patient.ID=Patient.ID,sample.type="Plasma taken")])
+)
+x <- merge(x,y)
+x <- x[,.(patient.ID,sample.type,sample.date=sample.date-first.date)]
+x <- x[!is.na(sample.date)]
+
+ggplot(x) + aes(x=factor(patient.ID),y=sample.date) + 
+  geom_line() + geom_point(aes(shape=sample.type,colour=sample.type),size=2) + 
+  labs(y="# of Days",x="Patient ID") +
+  coord_flip() + theme_tufte(12) + theme(legend.position=c(.8, .8),legend.title=element_blank())
+```
+
+## N Samples
+
+```{r}
+x <- unique(detect$RECIST[,.(patient.ID,scan.id)])[,.(CT.N=.N),patient.ID]
+y <- detect$sWG.meta[Sample.type=="ctDNA",.(BC.N=.N),.(patient.ID=Patient.ID)]
+x <- melt(merge(x,y,all=T),id.vars = 1)
+ggplot(x) + aes(x=value) + geom_bar() + facet_wrap(~variable) + theme_bw() + xlab("")
+```
+
+# Measure comparison
+
+## pairs plot
+
+```{r}
+get.measures <- function(detect){
+  return(cbind(
+  detect$ichorCNA.summary[,.(ichorCNA.best=1-n_est)],
+  detect$ichorCNA.summary.low[,.(ichorCNA.low=1-n_est)],
+  detect$ichorCNA.summary.default[,.(ichorCNA.default=1-n_est)],
+  detect$z.OR[,.(z.OR=z.OR)],
+  detect$t.MAD[,.(t.Mad=t.MAD)],
+  detect$absolute[,.(absolute=purity)]
+  ))
+}
+get.measures.meta <- function(detect) return(cbind(detect$sWG.meta,get.measures(detect)))
+x <- get.measures.meta(detect)
+
+my_box <- function(data, mapping, ...) {
+  mapping$y <- mapping$x
+  mapping$x <- mapping$colour
+  ggplot(data = data, mapping = mapping) +
+    geom_boxplot(...)
+}
+
+ggpairs(x,columns = 9:14,mapping=aes(colour=Sample.type),diag=list(continuous=my_box))
+```
+
+
+## Progression-free surival (Andersen-Gill model)
+
+### All data
+
+```{r}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%y")]
+
+y <- get.measures.meta(detect)
+y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)]
+y <-  cbind(
+   y[,head(.SD,-1),.(patient.ID=Patient.ID)],
+   Date.collected.end = y[,.(tail(Date.collected,-1)),.(Patient.ID)][,V1]
+ )
+
+x <- merge(x,y)
+
+x <- x[,.(
+  start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+  end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+  event.date=floor(difftime(date,min(Date.collected),units="days")),
+  ichorCNA.best,ichorCNA.default,ichorCNA.low,z.OR,t.Mad,absolute,RECIST),
+  patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+# Construct models
+models <- list()
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(ichorCNA.best))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(ichorCNA.default))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(ichorCNA.low))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(z.OR))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(t.Mad))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(absolute))]
+names(models) <- c("ichorCNA.best","ichorCNA.default","ichorCNA.low","z.OR","t.MAD","absolute")
+
+# Model selection
+coefs <- rbindlist(lapply(models, function(m) data.table(coef(summary(m)))))
+coefs$model <- names(models)
+coefs$p.adj <- p.adjust(unlist(coefs[,5]), method = "hommel")
+coefs$conc <- sapply(models,function(m) as.numeric(summary(m)$concordance[1]))
+coefs$conc.se <- sapply(models,function(m) as.numeric(summary(m)$concordance[2]))
+coefs$aic <- sapply(models,function(m) AIC(m))
+coefs <- coefs[,c(6,1:5,7:10)]
+coefs[order(conc)]
+
+ggplot(coefs) + aes(x=model,y=conc,ymin=conc-conc.se,ymax=conc+conc.se) + geom_pointrange(size=1.5) + coord_flip() + labs(x="",y="Concordance") + theme_tufte(20)
+```
+
+Combined model
+
+```{r}
+m.combined <- x[,coxph(Surv(start,end,event) ~ ichorCNA.default + ichorCNA.low + z.OR + t.Mad + absolute)]
+summary(m.combined)
+```
+
+```{r}
+x <- as.data.table(coef(m.combined),keep.rownames="model")
+names(x) <- c("model","coef.combined")
+x <- merge(x,coefs)
+x <- melt(x,id.vars = 1,measure.vars = 2:3)
+ggplot(x) + aes(x=model,y=value) + geom_col() + facet_grid(variable~.,scales = "free") + theme_bw() + labs(x="",y="Coef")
+```
+
+Stepwise selection to test combined model
+
+```{r,eval=F}
+#DO NOT USE
+m <- x[,coxph(Surv(start,end,event) ~ ichorCNA.default + z.OR + t.Mad + absolute)]
+summary(step(m,direction = "both"))
+```
+
+
+```{r}
+library(penalized)
+opt1 <- optL1(x[,Surv(start,end,event)],x[,.(ichorCNA.low,ichorCNA.default,z.OR,t.Mad,absolute)],fold=nrow(x),standardize = T,trace=F)
+opt1$lambda
+pen <- penalized(x[,Surv(start,end,event)],penalized=~ ichorCNA.low +ichorCNA.default+ z.OR + t.Mad + absolute,data=x,lambda1 = opt1$lambda,standardize = T,steps = 100,,trace=F)
+plotpath(pen)
+fit <- pen[[length(pen)]]
+coef(fit,"all")
+
+m <- x[,coxph(Surv(start,end,event) ~
+  offset(coef(fit,"all")[2]*ichorCNA.low) +
+      offset(coef(fit,"all")[2]*ichorCNA.default) +
+  offset(coef(fit,"all")[3]*z.OR) +
+  offset(coef(fit,"all")[4]*t.Mad) +
+  offset(coef(fit,"all")[5]*absolute))]
+
+survConcordance(x[,Surv(start,end,event)] ~ predict(m))
+```
+
+Dimensionally reduced (via pca) model
+
+```{r}
+y <- get.measures(detect)
+y$ichorCNA.best <- NULL
+dr <- prcomp(y,center = TRUE,scale. = T)
+plot(dr$sdev^2)
+plot(cumsum(dr$sdev^2/sum(dr$sdev^2)))
+ggplot(melt(dr$rotation)) + aes(x=Var1,y=value) + geom_col(width=0.05) + geom_point(size=2) + geom_hline(yintercept = 0,linetype="dashed") + coord_flip() + facet_grid(~Var2) + theme(axis.text.x = element_text(angle=90,hjust=1)) + xlab("") + ylab("")
+```
+
+```{r}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%y")]
+
+y <- data.table(cbind(detect$sWG.meta,dr$x))
+
+y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)]
+y <-  cbind(
+   y[,head(.SD,-1),.(patient.ID=Patient.ID)],
+   Date.collected.end = y[,.(tail(Date.collected,-1)),.(Patient.ID)][,V1]
+ )
+
+x <- merge(x,y)
+
+x <- x[,.(
+  start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+  end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+  event.date=floor(difftime(date,min(Date.collected),units="days")),
+  PC1,PC2,PC3,PC4,PC5,RECIST),patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+models <- list(
+  x[,coxph(Surv(start,end,event) ~ PC1)],
+  x[,coxph(Surv(start,end,event) ~ PC2)],
+  x[,coxph(Surv(start,end,event) ~ PC3)],
+  x[,coxph(Surv(start,end,event) ~ PC4)],
+  x[,coxph(Surv(start,end,event) ~ PC5)]
+)
+coefs <- rbindlist(lapply(models, function(m) data.table(coef(summary(m)))))
+coefs$PC <- 1:length(models)
+coefs$p.adj <- p.adjust(unlist(coefs[,5]), method = "hommel")
+coefs$conc <- sapply(models,function(m) as.numeric(summary(m)$concordance[1]))
+coefs[order(conc)]
+```
+
+```{R}
+library(penalized)
+opt1 <- optL1(x[,Surv(start,end,event)],x[,.(PC1,PC2,PC3,PC4,PC5)],fold=nrow(x),standardize = F,trace = F)
+opt1$lambda
+pen <- penalized(x[,Surv(start,end,event)],penalized=~ PC1+PC2+PC3+PC4+PC5,data=x,lambda1 = opt1$lambda,standardize = F,steps = 100,trace=F)
+plotpath(pen)
+fit <- pen[[length(pen)]]
+coef(fit)
+m <- x[,coxph(Surv(start,end,event) ~ 
+                offset(coef(fit)[1]*PC1) +
+                offset(coef(fit,"all")[2]*PC2) +
+                offset(coef(fit,"all")[3]*PC3) +
+                offset(coef(fit,"all")[4]*PC4) +
+                offset(coef(fit,"all")[5]*PC5)
+              )]
+survConcordance(x[,Surv(start,end,event)] ~ predict(m))
+```
+
+ Latent factor model --> one factor --> just use PCA
+
+```{r,eval=F}
+library(psych)
+
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%y")]
+
+y <- get.measures(detect)
+y$ichorCNA.best <- NULL
+
+nfact <- fa.parallel(y,fm="ml",fa="fa")$nfact
+
+fa(y,nfactors = 2,rotate = "oblimin",fm="minres")
+
+dr <- prcomp(y,center = TRUE,scale. = T)
+y <- data.table(cbind(detect$sWG.meta,dr$x))
+
+y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)]
+y <-  cbind(
+   y[,head(.SD,-1),.(patient.ID=Patient.ID)],
+   Date.collected.end = y[,.(tail(Date.collected,-1)),.(Patient.ID)][,V1]
+ )
+
+x <- merge(x,y)
+
+x <- x[,.(
+  start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+  end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+  event.date=floor(difftime(date,min(Date.collected),units="days")),
+  PC1,PC2,PC3,PC4,PC5,RECIST),patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+
+m <- x[,coxph(Surv(start,end,event) ~ PC1 + PC2 + PC3 + PC4 + PC5)]
+summary(step(m,direction = "both"))
+ggplot(melt(dr$rotation)) + aes(x=Var1,y=value) + geom_col() + facet_wrap(~Var2) + theme(axis.text.x = element_text(angle=90,hjust=1))
+```
+
+### Patients with PT
+
+```{r, eval=F}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%y")]
+
+y <- cbind(
+  detect$sWG.meta,
+  detect$ichorCNA.summary[,.(ichorCNA.best=1-n_est)],
+  detect$ichorCNA.summary.low[,.(ichorCNA.low=1-n_est)],
+  detect$z.OR[,.(z.OR=z.OR)],
+  detect$t.MAD[,.(t.Mad=t.MAD)],
+  detect$absolute[,.(absolute=purity)],
+  detect$custom.carlos[,.(carlos=tumour.frac)]
+           )
+y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)]
+y <-  cbind(
+   y[,head(.SD,-1),.(patient.ID=Patient.ID)],
+   Date.collected.end = y[,.(tail(Date.collected,-1)),.(Patient.ID)][,V1]
+ )
+
+x <- merge(x,y)
+x <- x[!is.na(carlos)]
+
+x <- x[,.(
+  start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+  end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+  event.date=floor(difftime(date,min(Date.collected),units="days")),
+  ichorCNA.best,ichorCNA.low,z.OR,t.Mad,absolute,carlos,RECIST),patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+# Construct models
+models <- list()
+#models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ER.status)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ichorCNA.best)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ichorCNA.low)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ z.OR)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ t.Mad)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ absolute)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ carlos)]
+names(models) <- c("ichorCNA.best","ichorCNA.low","z.OR","t.MAD","absolute","carlos")
+
+# Model selection
+AICs <- sapply(models, AIC)
+sort(AICs)
+fit <- models[[which.min(AICs)]]
+summary(fit)
+
+# Stepwise selection to test combined model
+#m <- x[,coxph(Surv(start,end,event) ~ ichorCNA.best + ichorCNA.low + z.OR + t.Mad + absolute + carlos)]
+#summary(step(m))
+```
+
+## Segmentation lengths
+
+```{r}
+reduce.segmentation <- function(x){
+  x$grp <- x[,c(1,which(diff(V1)!=0)+1,.N+1),chr][,rep(1:length(diff(V1)), diff(V1)),chr][,V1]
+  x <- x[,.(start=min(start)+1,end=max(start)+1E6,V1=unique(V1),N.bins=.N),.(chr,grp)][,-c('grp')]
+  x$chr <- factor(x$chr,levels = c(1:22,"X"))
+  x
+}
+
+x <- cbind(
+  detect$sWG.meta,
+  seg.length.ichorCNA = sapply(detect$ichorCNA.bestModels, function(x){
+     x <- data.table(x$results$segs[[1]])
+     x[,min(end-(start-1))/1E6]
+  }),
+  seg.length.QDNA = sapply(1:nrow(detect$sWG.meta),function(i){
+    x <- detect$sWG$segments[,c(2,3,i+4),with=F]
+    names(x) <- c("chr","start","V1")
+    x <- reduce.segmentation(x)
+    x[,min(N.bins)]
+  })
+)
+ggplot(x) + aes(x=seg.length.ichorCNA,y=seg.length.QDNA,colour=cut(Mapped.reads,breaks=quantile(Mapped.reads))) + geom_point() + coord_equal() + ylim(0,30) + xlim(0,30) +  geom_abline(intercept = 0, slope = 1, linetype="dashed") + theme(legend.title = element_blank())
+```
+
+# Read counts
+
+## 1Mb bins
+
+```{r}
+prop.table(t(table(detect$ichorCNA.summary[Sample.type!="BC",.(n_est==1,cut(Mapped.reads,20))])),margin = 1)*100
+```
+
+# Consistency of CNA calls
+
+```{r}
+expand.segmentation <- function(detect){
+  segs.expanded <- lapply(detect$ichorCNA.bestModels, function(x){
+    segs <- data.table(x$results$segs[[1]])
+    segs[,.(seq(start-1,end-1e6,1E6),copy.number),.(chr,start,end)][,.(chr,start=V1,copy.number)]
+  })
+  
+  for(i in detect$ichorCNA.summary[,which(n_est==1)]){
+    segs.expanded[[i]][,copy.number:=2]
+  }
+  
+  segs.expanded <- cbind(
+    segs.expanded[[1]][,copy.number],
+    sapply(segs.expanded[-1], function(x){
+      merge(segs.expanded[[1]],x,by=c("chr","start"),all.x=TRUE)[,copy.number.y]
+    })
+  )
+  colnames(segs.expanded) <- names(detect$ichorCNA.bestModels)
+  segs.expanded
+}
+```
+
+## Correlation (bad measure)
+
+Note: One cannot calculate the correlation between two flat profiles.
+
+```{r,eval=F}
+segs.expanded <- expand.segmentation(detect)
+
+cor.matrix <- suppressWarnings(cor(segs.expanded,use="pairwise.complete.obs",method="spearman"))
+
+i <- which(detect$ichorCNA.summary[,Sample.type!="BC"])
+x <- cor.matrix[i,i]
+x[lower.tri(x)] <- NA
+x <- data.table(melt(x))
+x <- x[!is.na(value)]
+x <- x[Var1 != Var2]
+
+x$p.ID.1 <- detect$sWG.meta[match(x$Var1,detect$sWG.meta$Sample.name),Patient.ID]
+x$p.ID.2 <- detect$sWG.meta[match(x$Var2,detect$sWG.meta$Sample.name),Patient.ID]
+
+ggplot(x) + aes(x=p.ID.1==p.ID.2,y=value,fill=p.ID.1==p.ID.2) + geom_boxplot()
+ggplot(x[p.ID.1==p.ID.2]) + aes(x=factor(p.ID.1),y=value) + geom_boxplot() + theme(axis.text.x = element_text(angle=90,hjust = 1))
+```
+
+
+## Custom similarity metric
+
+```{r}
+segs.expanded <- expand.segmentation(detect)
+
+N <- ncol(segs.expanded)
+dist.matrix <- matrix(0,N,N)
+colnames(dist.matrix) <- colnames(segs.expanded)
+rownames(dist.matrix) <- colnames(segs.expanded)
+for(i in 1:N){
+  for(j in i:N){
+    #x <- abs(segs.expanded[,i] - segs.expanded[,j])
+    #x <- (0.5*sum(x==1) + sum(x>1)) / length(x)
+    
+    x <- sum(segs.expanded[,i] != segs.expanded[,j],na.rm = T)
+    x <- x - 0.5*sum( (segs.expanded[,i]>2 & segs.expanded[,j]>2) & (segs.expanded[,i] != segs.expanded[,j]) ,na.rm = T)
+    x <- x / sum( !is.na(segs.expanded[,i]) & !is.na(segs.expanded[,j]))
+    
+    dist.matrix[i,j] <- x
+    dist.matrix[j,i] <- x
+  }
+}
+```
+
+### Same patient vs diff patient
+
+```{R}
+i <- which(detect$ichorCNA.summary[,Sample.type!="BC" & n_est!=1])
+x <- dist.matrix[i,i]
+x[lower.tri(x)] <- NA
+x <- data.table(melt(x))
+x <- x[!is.na(value)]
+x <- x[Var1 != Var2]
+
+x$p.ID.1 <- detect$sWG.meta[match(x$Var1,detect$sWG.meta$Sample.name),Patient.ID]
+x$p.ID.2 <- detect$sWG.meta[match(x$Var2,detect$sWG.meta$Sample.name),Patient.ID]
+
+ggplot(x) + aes(x=p.ID.1==p.ID.2,y=value,fill=p.ID.1==p.ID.2) + geom_boxplot()
+ks.test(x[p.ID.1==p.ID.2,value],x[p.ID.1!=p.ID.2,value],alternative = "g")
+```
+
+### BC grouping
+
+```{r}
+pdf(paste0(project.dir,"results/detect/plots/ichorCNA.clustering/all.BC.pdf"))
+plot(as.phylo(hclust(as.dist(dist.matrix))),type="fan",cex=0.5,tip.color=detect$ichorCNA.summary[,as.numeric(factor(Sample.type=="BC"))])
+dev.off()
+plot(as.phylo(hclust(as.dist(dist.matrix))),type="fan",cex=0.5,tip.color=detect$ichorCNA.summary[,as.numeric(factor(Sample.type=="BC"))])
+```
+
+### Patient-wise grouping
+
+```{r}
+i <- which(detect$ichorCNA.summary[,Sample.type != "BC" & n_est!=1])
+for(p.ID in unique(detect$ichorCNA.summary[i,Patient.ID])){
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.clustering/",p.ID,".pdf"))
+  plot(as.phylo(hclust(as.dist(dist.matrix[i,i]))),type="fan",cex=0.7,tip.color=detect$ichorCNA.summary[i,as.numeric(factor(Patient.ID==p.ID))])
+  dev.off()
+}
+```
+
+### IGP 
+
+Not sure if appropriate for this. --> Needs centroids --> Could use primary tumours? --> Nope, Rand indices more appropiate.
+
+https://academic.oup.com/biostatistics/article/8/1/9/251048#2979265
+
+```{r, eval=F}
+i <- which(detect$ichorCNA.summary[,Sample.type != "BC" & n_est!=1])
+dist.matrix.sub <- dist.matrix[i,i]
+diag(dist.matrix.sub) <- NA
+nns <- apply(dist.matrix.sub,1,which.min)
+
+assigned.groups <- detect$ichorCNA.summary[i][,Patient.ID]
+x <- sapply(unique(assigned.groups),function(group){
+  i <- which(assigned.groups==group)
+  if (length(i) == 1) return(NA)
+  else return(sum(nns[i] %in% i) / length(i))
+})
+x <- data.table(patient.ID=unique(assigned.groups),N=detect$ichorCNA.summary[i][,.N,Patient.ID][,N],IGP=x)
+x[,.(.N,median(IGP)),.(N_g=N)][order(N_g)]
+```
+
+### (adj) Rand index w.r.t hierachal clustering
+
+```{r}
+pat.subset <- detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>2,Patient.ID]
+i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID %in% pat.subset])
+dist.matrix.sub <- dist.matrix[i,i]
+meta.sub <- detect$ichorCNA.summary[i]
+
+j <- as.numeric(factor(meta.sub[,Patient.ID]))
+k <- cutree(hclust(as.dist(dist.matrix.sub)),nrow(meta.sub[,.N,Patient.ID]))
+
+rand.index(j,k)
+adj.rand.index(j,k)
+```
+
+### (adj) Rand index w.r.t simlarity to primary tumours
+
+```{r}
+pat.subset <- intersect(
+  detect$ichorCNA.summary[Sample.type=="PT" & n_est!=1,Patient.ID],
+  detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>2,Patient.ID]
+)
+i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID %in% pat.subset])
+j <- which(detect$ichorCNA.summary[,Sample.type == "PT" & Patient.ID %in% pat.subset])
+j <- j[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+
+group_ref <- as.numeric(factor(detect$ichorCNA.summary[i,Patient.ID]))
+group_pred <- as.numeric(factor(sapply(i, function(x) detect$ichorCNA.summary[j[which.min(dist.matrix[x,j])],Patient.ID] )))
+group_euclid <- cutree(hclust(as.dist(dist.matrix[i,i])),length(pat.subset))
+  
+rand.index(group_ref,group_pred)
+adj.rand.index(group_ref,group_pred)
+
+rand.index(group_ref,group_euclid)
+adj.rand.index(group_ref,group_euclid)
+```
+
+### (adj) Rand index w.r.t simlarity to met tumours
+
+```{r}
+pat.subset <- intersect(
+  detect$ichorCNA.summary[Sample.type=="MT" & n_est!=1,Patient.ID],
+  detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>2,Patient.ID]
+)
+i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID %in% pat.subset])
+j <- which(detect$ichorCNA.summary[,Sample.type == "MT" & Patient.ID %in% pat.subset])
+j <- j[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+
+group_ref <- as.numeric(factor(detect$ichorCNA.summary[i,Patient.ID]))
+group_pred <- as.numeric(factor(sapply(i, function(x) detect$ichorCNA.summary[j[which.min(dist.matrix[x,j])],Patient.ID] )))
+group_euclid <- cutree(hclust(as.dist(dist.matrix[i,i])),length(pat.subset))
+
+rand.index(group_ref,group_pred)
+adj.rand.index(group_ref,group_pred)
+
+rand.index(group_ref,group_euclid)
+adj.rand.index(group_ref,group_euclid)
+```
+
+### Distance from PT
+
+```{r}
+pat.subset <- intersect(
+  detect$ichorCNA.summary[Sample.type=="PT" & n_est!=1,Patient.ID],
+  detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>4,Patient.ID]
+)
+x <- rbindlist(lapply(pat.subset,function(p.ID){
+  i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID == p.ID])
+  j <- which(detect$ichorCNA.summary[,Sample.type == "PT" & n_est!=1 & Patient.ID == p.ID])
+  j <- j[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+  x <- detect$ichorCNA.summary[i]
+  x$PT.dist <- dist.matrix[i,j]
+  return(x)
+}))
+ggplot(x) + aes(x=factor(Patient.ID),y=PT.dist,label=Sample.num,fill=factor(Sample.num)) + geom_label() + ylim(0,1) + theme_bw() + theme(panel.grid.major.y = element_blank(),panel.grid.minor.y=element_blank(),legend.position = "none")
+```
+
+### PT vs MT distance
+
+```{r}
+pat.subset <- intersect(
+  detect$ichorCNA.summary[Sample.type=="MT" & n_est!=1,Patient.ID],
+  intersect(
+    detect$ichorCNA.summary[Sample.type=="PT" & n_est!=1,Patient.ID],
+    detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>0,Patient.ID]
+)) 
+lapply(pat.subset,function(p.ID){
+  i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID == p.ID])
+  j <- which(detect$ichorCNA.summary[,Sample.type == "PT" & n_est!=1 & Patient.ID == p.ID])
+  j <- j[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+  k <- which(detect$ichorCNA.summary[,Sample.type == "MT" & n_est!=1 & Patient.ID == p.ID])
+  k <- k[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+  d <- rbindlist(lapply(i, function(l) list(PT=dist.matrix[l,j],MT=dist.matrix[l,k])))
+  d$sample.name <- detect$ichorCNA.summary[i,Sample.name]
+  d
+})
+```
+
+
+# Timecourse plots
+
+## CT vs RECIST (based on tumour volumes)
+
+```{r,eval=F}
+pat.subset <- unique(detect$RECIST[scan.id!="B",.(patient.ID,scan.id)])[,.N,patient.ID][order(N)][N>=2,patient.ID]
+
+x <- detect$RECIST[patient.ID %in% pat.subset,.(value=sum(size,na.rm=T)),.(patient.ID,scan.id,date)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,scan.id=Sample.num,date=Date.collected)]
+z <- detect$RECIST[patient.ID %in% pat.subset & !(location %in% c("BRA")),.(value=sum(size,na.rm=T)),.(patient.ID,scan.id,date)]
+xx <- detect$RECIST[patient.ID %in% pat.subset & !(location %in% c("BO")),.(value=sum(size,na.rm=T)),.(patient.ID,scan.id,date)]
+xy <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=Subclone_Frac),.(patient.ID=Patient.ID,scan.id=Sample.num,date=Date.collected)]
+
+x <- rbind(
+  x[,.(patient.ID,date=as.Date(x$date,"%d/%m/%y"),variable="Sum.Tumour.Volume",variable.2="All",value)],
+  y[,.(patient.ID,date=as.Date(date),variable="ichorCNA.Tumour.Frac",variable.2="All",value)],
+  z[,.(patient.ID,date=as.Date(x$date,"%d/%m/%y"),variable="Sum.Tumour.Volume",variable.2="No.Brain",value)],
+  xx[,.(patient.ID,date=as.Date(x$date,"%d/%m/%y"),variable="Sum.Tumour.Volume",variable.2="No.Bone",value)],
+  xy[,.(patient.ID,date=as.Date(date),variable="ichorCNA.Subclone.Frac",variable.2="All",value)]
+)
+x <- x[!is.na(date)]
+x$variable <- factor(x$variable,levels = c("ichorCNA.Subclone.Frac","ichorCNA.Tumour.Frac","Sum.Tumour.Volume"))
+
+z <- unique(detect$RECIST[patient.ID %in% pat.subset & scan.id != "B",.(date,response,patient.ID)])[,.(xstart=date,xend=c(tail(date,-1),"NA"),response),patient.ID]
+z <- z[,.(patient.ID,date.start=as.Date(xstart,"%d/%m/%y"),date.end=as.Date(xend,"%d/%m/%y"),RECIST=response)]
+z$RECIST <- factor(z$RECIST,levels=c("CR","PR","Non-CR/Non-PD","SD","PD"))
+
+for(p.ID in pat.subset){
+  if(z[patient.ID == p.ID][.N,date.start] < x[patient.ID == p.ID, max(date)]) z[patient.ID == p.ID,date.end:= c(head(date.end,-1),x[patient.ID == p.ID, max(date)])]
+}
+
+cols <- c("lightskyblue","paleturquoise","lightgreen","lightgreen","palevioletred")
+names(cols) <- levels(z$RECIST)
+
+for(p.ID in pat.subset){
+  p <- ggplot() + geom_rect(data=z[patient.ID==p.ID],aes(xmin=date.start,xmax=date.end, ymin = -Inf, ymax = Inf,fill = RECIST),alpha=0.5) + geom_line(data=x[patient.ID==p.ID],aes(x=date,y=value,linetype=variable.2)) + geom_point(data=x[patient.ID==p.ID],aes(x=date,y=value)) + facet_grid(variable~.,scales = "free") + scale_fill_manual(values = cols) + ggtitle(paste("Patient:",p.ID)) + scale_linetype_manual(values=c("solid","dotdash", "dashed"),name="Tumours Summated")
+  p <- p + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + ylab("")
+  ggsave(paste0(project.dir,"results/detect/plots/ichorCNA.vs.CT/",p.ID,".pdf"),p)
+}
+```
+
+## CT vs RECIST (Emma)
+
+```{r}
+pat.subset <- detect$ichorCNA.summary[Sample.type=="ctDNA",.N,Patient.ID][order(N)][N>=2,Patient.ID]
+
+x <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(ichorCNA.Tumour.Frac=(1-n_est)*100),.(patient.ID=Patient.ID,scan.id=Sample.num,date=Date.collected)]
+x <-   x[,.(patient.ID,date=as.Date(date),ichorCNA.Tumour.Frac)]
+x <- x[!is.na(date)]
+
+y <- detect$treatment[patient.ID %in% pat.subset,.(patient.ID,date.start=as.Date(start.date,"%d/%m/%y"),date.end=as.Date(end.date,"%d/%m/%y"),treatment)]
+y <- rbindlist(lapply(pat.subset,function(p.ID) y[patient.ID == p.ID & date.start<x[patient.ID == p.ID, max(date)]] ))
+for(p.ID in pat.subset) y[patient.ID == p.ID & (is.na(date.end) | date.end>x[patient.ID == p.ID, max(date)]),date.end:=x[patient.ID == p.ID, max(date)]] 
+
+z <- unique(detect$RECIST[patient.ID %in% pat.subset & scan.id != "B",.(date,response=RECIST,patient.ID)])[,.(xstart=date,xend=c(tail(date,-1),"NA"),response),patient.ID]
+z <- z[,.(patient.ID,date.start=as.Date(xstart,"%d/%m/%y"),date.end=as.Date(xend,"%d/%m/%y"),RECIST=response)]
+z <- rbindlist(lapply(pat.subset,function(p.ID) z[patient.ID == p.ID & date.start<x[patient.ID == p.ID, max(date)]] ))
+z[RECIST=="NMD",RECIST:="NM"]
+#for(p.ID in pat.subset) z[patient.ID == p.ID,date.end:= c(head(date.end,-1),x[patient.ID == p.ID, max(date)])]
+
+for(p.ID in pat.subset){
+  y.max <- max(x[patient.ID==p.ID,ichorCNA.Tumour.Frac])
+  if(y.max == 0) y.max <- 0.1
+  
+  p <- ggplot()  
+  
+  if(nrow(y[patient.ID==p.ID])){
+    y.sub <- y[patient.ID==p.ID]
+    y.sub$treatment <- factor(y.sub$treatment,levels = unique(y.sub$treatment))
+    p <- p + 
+      geom_rect(data=y.sub,aes(xmin=date.start,xmax=date.end, ymin = -Inf, ymax = Inf,fill = treatment),alpha=0.5) +
+      scale_fill_brewer(palette = "Set3",name="Treatment")
+  } 
+    
+  p <- p +
+    geom_line(data=x[patient.ID==p.ID],aes(x=date,y=ichorCNA.Tumour.Frac)) +
+    geom_point(data=x[patient.ID==p.ID],aes(x=date,y=ichorCNA.Tumour.Frac)) +
+    ylim(0,y.max)
+  
+  p <- p +
+    labs(title=" ",tag=paste("Patient:",p.ID)) +
+    theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  
+  if(z[patient.ID==p.ID,.N]){ 
+    for(i in 1:nrow(z[patient.ID==p.ID])){
+      ds <- z[patient.ID==p.ID][i,date.start]
+      R <- z[patient.ID==p.ID][i,RECIST]
+      p <- p + 
+        annotation_custom(segmentsGrob(gp = gpar(col = "black", lwd = 2)),xmin=ds,xmax=ds,ymin=y.max+(0.02*y.max),ymax=y.max+(0.06*y.max)) +
+        annotation_custom(textGrob(R, gp = gpar(col = "black"),rot=-90,hjust=2),xmin=ds,xmax=ds,ymin=y.max,ymax=y.max)
+    }
+  }
+  
+  g <- ggplotGrob(p)
+  g$layout$clip[g$layout$name=="panel"] <- "off"
+  
+  #grid.newpage()
+  #grid.draw(g)
+  
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.vs.Emma/",p.ID,".pdf"),width = 10,height = 4)
+  grid.draw(g)
+  dev.off()
+}
+```
+
+
+# Gene-level copy numbers
+
+## HER2
+
+```{r}
+her2.id <- mapIds(org.Hs.eg.db,keys=c("HER2"),column="ENTREZID",keytype = "ALIAS")
+her2.tx <- genes(Tx.Db)
+her2.tx <- her2.tx[her2.tx$gene_id == her2.id]
+seqlevels(her2.tx) <- gsub("chr","",seqlevels(her2.tx))
+her2.tx$gene_id <- "HER2"
+
+width(her2.tx) / 100 # expected reads at 0.01x with no amplification
+```
+
+
+### Primary ichorCNA calls
+
+```{r}
+her2.CN <- sapply(detect$ichorCNA.bestModels, function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  segs$copy.number[findOverlaps(her2.tx, segs,type="within",select = "first")]
+})
+
+x <- cbind(detect$ichorCNA.summary,her2.CN)
+x <- x[n_est!=1]
+
+ggplot(x) + aes(x=her2.CN) + geom_bar() + facet_grid(Sample.type~.,scale="free_y")
+```
+
+```{r}
+i <- detect$ichorCNA.summary[,which(Sample.type!="BC" & n_est!=1) ]
+
+her2.CN <- sapply(detect$ichorCNA.bestModels[i], function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  segs$copy.number[findOverlaps(her2.tx, segs,type="within",select = "first")]
+})
+
+qplot(her2.CN,bins="5") + geom_bar(colour="white")
+```
+
+### Binned reads
+
+```{r}
+x <- detect$sWG$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+```{r}
+x <- detect$sWG$cns
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+### Binned reads [100kb]
+
+```{r}
+x <- sWG.load.data(paste0(project.dir,"data/sWG/100kb/"))
+i <- c(1:4,match(detect$ichorCNA.summary$Sample.name,colnames(x$cns)))
+x$cns <- x$cns[,i,with=F]
+x$segments <- x$segments[,i,with=F]
+
+x <- x$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+```{r}
+x <- sWG.load.data(paste0(project.dir,"data/sWG/100kb/"))
+i <- c(1:4,match(detect$ichorCNA.summary$Sample.name,colnames(x$cns)))
+x$cns <- x$cns[,i,with=F]
+x$segments <- x$segments[,i,with=F]
+
+x <- x$cns
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+## CN driver genes
+
+```{r}
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"]
+
+mut.driver.genes <- scan(paste0(project.dir,"data/bp-ts-mutdriver.txt"),what="",sep="\n")
+mut.driver.genes <- mapIds(org.Hs.eg.db,keys=mut.driver.genes,column="ENTREZID",keytype = "ALIAS")
+
+Tx.genes <- genes(Tx.Db)
+Tx.genes <- Tx.genes[Tx.genes$gene_id %in% mut.driver.genes]
+seqlevels(Tx.genes) <- gsub("chr","",seqlevels(Tx.genes))
+Tx.genes <- Tx.genes[order(Tx.genes)] 
+Tx.genes$gene_id <- names(mut.driver.genes)[match(Tx.genes$gene_id,mut.driver.genes)]
+
+copy.number <- rbindlist(lapply(detect$ichorCNA.bestModels, function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number[,AKT1:=NULL]
+
+copy.number <- merge(detect$ichorCNA.summary[,.(Sample.name,Sample.num,Sample.type,Patient.ID,n_est)],copy.number)
+copy.number <- copy.number[Sample.type=="ctDNA"]
+copy.number <- melt(copy.number,id.vars = c("Sample.name","Sample.num","Sample.type","Patient.ID","n_est"))
+copy.number <- copy.number[order(as.numeric(Patient.ID),Sample.num)]
+copy.number[n_est == 1, value:=2]
+copy.number$value <- factor(copy.number$value)
+
+cols <- c("steelblue","grey85","orange","orangered","red")
+names(cols) <- 1:5
+
+for(p.ID in y[,unique(Patient.ID)]){
+  p2 <- ggplot(y[Patient.ID==p.ID]) + aes(x=factor(Sample.num),y=1-n_est) + geom_col() +
+        ylim(0,1) + theme_bw() + ylab("IchorCNA\nTumour Fraction") +
+        theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),axis.title.x = element_blank())
+  
+  #scale_x <- as.character(y[Patient.ID==p.ID,interaction(Patient.ID,Sample.num,sep=":",drop=T,lex.order = T)])
+  
+  p1 <- ggplot(copy.number[Patient.ID==p.ID]) + aes(x=factor(interaction(Patient.ID,Sample.num,sep=":",drop=T,lex.order = T)),y=variable,fill=factor(value)) + geom_tile(color="white") +
+        theme_grey() + scale_fill_manual(values=cols,na.value="black",name="Copy\nNumber") + 
+        theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5,size=5),legend.position = "bottom",axis.title = element_blank())
+  
+  gA=ggplot_gtable(ggplot_build(p1))
+  gB=ggplot_gtable(ggplot_build(p2))
+  
+  maxWidth = grid::unit.pmax(gA$widths, gB$widths)
+  gA$widths <- as.list(maxWidth)
+  gB$widths <- as.list(maxWidth)
+  
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.gene.CN/",p.ID,".pdf"))
+  grid.arrange(
+   arrangeGrob(gB,gA,nrow=2,heights=c(.2,.8))
+  )
+  dev.off()
+}
+
+```
+
+## Circus Plots
+
+### Individual samples (non-circus)
+
+```{r}
+theme_sWG <- theme_tufte(20) + theme(
+  axis.ticks.x=element_blank(),
+  axis.text.x=element_blank(),
+  panel.spacing.x=unit(0, "lines"),
+  panel.border=element_rect(color="grey80",fill=NA,size=1,linetype="solid"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  axis.title.x = element_blank(),
+  legend.title = element_blank(),
+  legend.position="bottom"
+)
+
+fct_labels <- c(1:22,"X")
+names(fct_labels) <-  c(1:22,"X")
+fct_labels[seq(10,23,2)] <- ""
+fct_labels[21] <- ""
+fct_labels <- as_labeller(fct_labels)
+
+for(i in 1:nrow(detect$ichorCNA.summary)){
+  
+    p <- ggplot() + aes(x=start,y=log2) + facet_grid(~chr,scales = "free_x",space="free_x",labeller = fct_labels) + ylim(-3,5) +
+      scale_linetype_manual(values=c("FALSE"="solid","TRUE"="dotted")) + theme_sWG +
+      scale_colour_manual(values=c("1"="steelblue","2"="green","3"="orange","4"="orangered","5"="red"),name="Copy\nNumber")
+    
+    y <- detect$sWG$cns[,c(2:4,i+4),with=F]
+    names(y) <- c("chr","start","end","log2")
+    y$chr <- factor(y$chr,levels=c(1:22,"X"))
+    p <- p + geom_point(data=y,size=0.05)
+    
+    x <- data.table(detect$ichorCNA.bestModels[[i]]$results$segs[[1]])
+    if(detect$ichorCNA.summary[i,n_est]==1) x[,copy.number:=2]
+    x <- x[,.(chr,start,end,log2=median,copy.number,subclone.status)]
+    x$chr <- factor(x$chr,levels=c(1:22,"X"))
+    x$copy.number <- factor(x$copy.number,levels=1:5)
+    p <- p + geom_segment(aes(xend=end,yend=log2,color=copy.number,linetype=subclone.status),data = x,size=1.2)
+    
+    p <- p + ggtitle(detect$ichorCNA.summary[i,paste0(Sample.name,": ",(1-n_est)*100,"%")])
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.indv/",detect$ichorCNA.summary[i,Sample.name],".pdf"),plot=p,width = 10, height = 5)
+}
+```
+
+### Patient-wise
+
+```{r}
+for(p.ID in unique(detect$ichorCNA.summary$Patient.ID)){
+  i <- detect$ichorCNA.summary[,which(Patient.ID == p.ID & Sample.type!="BC")]
+  if(length(i)!=0){
+    segs <- lapply(i, function(j) {
+      x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    names(segs) <- detect$ichorCNA.summary[i,paste0(Patient.ID,":",ifelse(!is.na(Sample.num),Sample.num,Sample.type)," (",signif(1-n_est,3)*100,"%)")]
+    p <- circus.plot(segs)
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus/",p.ID,".pdf"),width = 10, height = 10)
+  }
+}
+```
+
+
+### Patient-combined
+
+```{r}
+expand.segmentation <- function(segs){
+  segs.expanded <- lapply(segs, function(x){
+    x[,.(seq(start-1,end-1e6,1E6),copy.number),.(chr,start,end)][,.(chr,start=V1,copy.number)]
+  })
+  if(length(segs.expanded) == 1) segs.expanded <- segs.expanded[[1]]
+  else {
+    segs.expanded <- cbind(
+      segs.expanded[[1]],
+      sapply(segs.expanded[-1], function(x){
+        merge(segs.expanded[[1]],x,by=c("chr","start"),all.x=TRUE,sort=F)[,copy.number.y]
+      })
+    )
+  }
+  return(segs.expanded)
+}
+
+aggregate.segmentation <- function(segs.expanded){
+  x <- segs.expanded[,-(1:2)]
+  N <- ncol(x)
+  x <- cbind(segs.expanded[,1:2],V1=rowSums(x<2,na.rm=T),V2=rowSums(x>2,na.rm=T),V3=rowSums(is.na(x)))
+  
+  x[V3>(N/10),V1:=NA]
+  x[,V1:=V1/(N-V3)]
+  x[,V1:=na.locf(V1)]
+
+  x[V3>(N/10),V2:=NA]
+  x[,V2:=V2/(N-V3)]
+  x[,V2:=na.locf(V2)]
+  
+  x
+}
+
+reduce.segmentation.wrapper <- function(segs.aggregated){
+  l <- segs.aggregated[,.(chr,start,V1)]
+  g <- segs.aggregated[,.(chr,start,V1=V2)]
+  x <- list(
+    gain =  reduce.segmentation(g),
+    loss =  reduce.segmentation(l)
+  )
+  x
+}
+
+reduce.segmentation <- function(x){
+  x$grp <- x[,c(1,which(diff(V1)!=0)+1,.N+1),chr][,rep(1:length(diff(V1)), diff(V1)),chr][,V1]
+  x <- x[,.(start=min(start)+1,end=max(start)+1E6,V1=unique(V1),N.bins=.N),.(chr,grp)][,-c('grp')]
+  x$chr <- factor(x$chr,levels = c(1:22,"X"))
+  x
+}
+
+
+chromo <- seqlengths(Hsapiens)[1:23]
+chromo <- data.table(chr=factor(substr(names(chromo),4,6),levels = c(1:22,"X")),start=1,end=as.numeric(chromo),V1=0)
+
+for(p.ID in unique(detect$ichorCNA.summary$Patient.ID)){
+  i <- detect$ichorCNA.summary[,which(Patient.ID == p.ID & Sample.type=="ctDNA" & n_est != 1)]
+  if(length(i)!=0){
+    segs <- lapply(i, function(j) {
+      x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    segs.expanded <- expand.segmentation(segs)
+    segs.aggregated <- aggregate.segmentation(segs.expanded)
+    segs.agg.reduced <- reduce.segmentation(segs.aggregated)
+    
+#    x <- makeGRangesFromDataFrame(segs.agg.reduced,keep.extra.columns = T)
+#    chromo <- makeGRangesFromDataFrame(segs.agg.reduced[,.(start=min(start),end=max(end)),chr])
+#    seqlengths(chromo) <- segs.agg.reduced[,max(end),chr][,V1]=
+#    p <- ggbio() + 
+#    circle(x,geom="bar",aes(y=V1,fill=V1),grid=T,ylim=c(-1,1)) + 
+#    circle(chromo, geom = "text", aes(label = seqnames)) +
+#    ggtitle(paste0("Patient ",p.ID," (N = ",length(segs),")")) +
+#    scale_fill_gradient2(low="skyblue",high = "palevioletred",limits=c(-1,1))
+#    no way to specify ylim on the axis without a lot of hacking --> not an important plot, so just making a ggplot2 one instead     
+    
+    segs.agg.reduced$chr <- factor(segs.agg.reduced$chr,levels = c(1:22,"X"))
+    p <- ggplot(segs.agg.reduced) + aes(xmin=start,xmax=end,ymin=0,ymax=V1,fill=V1<0) + geom_rect() +
+      ylim(-1,1) + facet_grid(~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+      theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none") +
+      ggtitle(paste0("Patient ",p.ID," (N = ",length(segs),")"))
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus.comb/",p.ID,".pdf"),plot=p,width = 10, height = 10)
+  }
+}
+```
+
+### All patient-combined
+
+```{r}
+get_segs <- function(i){
+  segs <- lapply(i, function(j) {
+    x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+    if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+    return(x)
+  })
+  segs.expanded <- expand.segmentation(segs)
+  segs.aggregated <- aggregate.segmentation(segs.expanded)
+  segs.agg.reduced <- reduce.segmentation.wrapper(segs.aggregated)
+  return(segs.agg.reduced)
+}
+
+chromo <- seqlengths(Hsapiens)[1:23]
+chromo <- data.table(chr=factor(substr(names(chromo),4,6),levels = c(1:22,"X")),start=1,end=as.numeric(chromo),V1=0)
+
+i <- detect$ichorCNA.summary[,which(Sample.type=="PT")]
+i <- i[ detect$ichorCNA.summary[i][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+segs.agg.reduced.PT <- get_segs(i)
+segs.agg.reduced.PT$gain$sample.type <- paste0("Primary (",length(i),")")
+segs.agg.reduced.PT$loss$sample.type <- paste0("Primary (",length(i),")")
+
+i <- detect$ichorCNA.summary[,which(Sample.type=="ctDNA" & n_est!=1)]
+i <- i[ detect$ichorCNA.summary[i][,.I[which.min(n_est)],Patient.ID][,V1] ]
+segs.agg.reduced.ctDNA <- get_segs(i)
+segs.agg.reduced.ctDNA$gain$sample.type <- paste0("ctDNA (",length(i),")")
+segs.agg.reduced.ctDNA$loss$sample.type <- paste0("ctDNA (",length(i),")")
+
+segs.agg.reduced <- list(
+  gain = rbind(segs.agg.reduced.ctDNA$gain,segs.agg.reduced.PT$gain),
+  loss = rbind(segs.agg.reduced.ctDNA$loss,segs.agg.reduced.PT$loss)
+)
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+p <- ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none")
+p
+```
+
+```{r}
+p <- ggplot() + aes(x=start,xend=end,y=V1,yend=V1) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$gain) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$loss) +
+  geom_hline(yintercept=0,linetype="dashed",colour="black") +
+  ylim(-1,1) + facet_grid(~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="bottom") +
+  scale_color_brewer(palette="Dark2") + xlab("") + ylab("")
+p
+```
+
+
+```{r}
+metabric <- list(
+  meta = fread(paste0(root.dir,"metabric/data/patientData.txt")),
+  cna = fread(paste0(root.dir,"metabric/data/ascatSegments.txt"))
+)
+her2.samples <- metabric$meta[her2Status=="POS",sample]
+her2.samples <- metabric$cna[sample %in% her2.samples]
+her2.samples <- by(her2.samples,her2.samples[,sample],function(x){
+  x <- x[,.(chr=gsub("chr","",chr),start=floor(start/1E6)*1E6 + 1,end=floor(end/1E6)*1E6,copy.number=log2((nMajor + nMinor)/ploidy))]
+  x <- x[start<end]
+  x[,copy.number:=ifelse(copy.number>(.4),3,ifelse(copy.number<(-0.5),1,2))]
+  x[chr==23,chr:="X"]
+  data.table(x)
+})
+
+her2.samples.expanded <- expand.segmentation(her2.samples)
+her2.samples.aggregated <- aggregate.segmentation(her2.samples.expanded)
+her2.samples.agg.reduced <- reduce.segmentation.wrapper(her2.samples.aggregated)
+her2.samples.agg.reduced$gain$sample.type <- paste0("Metabric (",length(her2.samples),")")
+her2.samples.agg.reduced$loss$sample.type <- paste0("Metabric (",length(her2.samples),")")
+
+segs.agg.reduced <- list(
+  gain = rbind(segs.agg.reduced.ctDNA$gain,segs.agg.reduced.PT$gain,her2.samples.agg.reduced$gain),
+  loss = rbind(segs.agg.reduced.ctDNA$loss,segs.agg.reduced.PT$loss,her2.samples.agg.reduced$loss)
+)
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+p <- ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none")
+p
+```
+
+
+
+# Progression-free survival
+
+
+## 17.p loss
+
+```{r,eval=F}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+
+
+i <- detect$ichorCNA.summary[,which(Sample.type=="PT")]
+i <- i[ detect$ichorCNA.summary[i][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+sapply(detect$ichorCNA.bestModels[i], function(x){
+  x <- x$results$segs[[1]]
+  x$copy.number[x$chr=="17"][1]
+})
+
+```
+
+## Slope?
+
+```{r}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% x$patient.ID, .(tumour.frac=1 - n_est, Date.collected, round(difftime(Date.collected,x[patient.ID==Patient.ID,as.Date(date,"%d/%m/%y")])))  ,Patient.ID][V3 <= 0]
+y <- y[ Patient.ID %in% y[,.N,Patient.ID][N>=2,Patient.ID],tail(.SD,2),Patient.ID]
+table(y[,diff(tumour.frac),Patient.ID][,ifelse(V1>0,"Increase",ifelse(V1<0,"Decrease","No.change"))])
+```
+
+
+## First Sample
+
+```{r}
+ggplot(detect$ichorCNA.summary[Sample.type=="ctDNA"]) + aes(x=Sample.num==1,y=1-n_est,colour=Sample.num==1) +  geom_boxplot(width=0.2,outlier.shape = NA) #+ geom_jitter(width=0.2)
+#ggplot(detect$z.OR.score[Sample.type=="ctDNA"]) + aes(x="",y=z.OR,colour=Sample.num==1) +  geom_boxplot(width=0.2,outlier.shape = NA) + geom_jitter(width=0.2)
+```
+
+```{r}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x <- merge(x,  detect$sWG.meta[Sample.type=="ctDNA",.(first.blood=min(Date.collected,na.rm = T)),.(patient.ID=Patient.ID)],by="patient.ID")
+x <- merge(x, detect$ichorCNA.summary[Sample.type=="ctDNA",head(.SD,1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac=1 - n_est)])
+x[,days.till.PD:=round(difftime(as.Date(date,"%d/%m/%y"),first.blood))]
+x <- x[days.till.PD>0]
+
+x <- x[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+
+x[,tumour.frac.above.10:=tumour.frac>.1]
+fit <- x[,survfit(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.above.10)]
+ggsurvplot(fit,x,risk.table = T,pval = TRUE,break.time.by=250,risk.table.y.text=F)
+
+x[,non.zero.tumour.frac:=tumour.frac!=0]
+fit <- x[,survfit(Surv(days.till.PD,RECIST=="PD") ~ non.zero.tumour.frac)]
+ggsurvplot(fit,x,risk.table = T,pval = TRUE,break.time.by=250,risk.table.y.text=F)
+```
+
+
+```{r}
+models <- suppressWarnings(lapply(0:99*0.01, function(i){
+  x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac > i)]
+}))
+models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac == 1)]
+models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac)]
+names(models) <- c(paste0("threshold=",0:100*0.01),"continuous")
+
+head(sort(sapply(models, AIC)))
+best.model <- models[[which.min(lapply(models, AIC))]]
+summary(best.model)
+
+new.dat <- data.table(tumour.frac=(0:5)/5)
+fit <- survfit(best.model, newdata = new.dat)
+ggsurvplot(fit, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat )
+```
+
+## First + Second Sample
+
+```{r}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+
+p.subset <- detect$ichorCNA.summary[Sample.type=="ctDNA",.N,Patient.ID][N>=2,Patient.ID]
+
+x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",head(.SD,1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s1=1 - n_est,first.blood=Date.collected)])
+x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",tail(head(.SD,2),1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s2=1 - n_est,second.blood=Date.collected)])
+x[,days.till.PD:=round(difftime(as.Date(date,"%d/%m/%y"),second.blood,units="days"))]
+x <- x[days.till.PD>0]
+
+x <- x[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+
+x[,tumour.frac.delta:=tumour.frac.s2-tumour.frac.s1]
+x[,tumour.frac.delta.sign:=tumour.frac.delta>0]
+x[,tumour.frac.s1.above.10:=tumour.frac.s1>.1]
+x[,tumour.frac.s1.nonzero:=tumour.frac.s1!=0]
+
+m <- list(
+    Nth=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2)],
+    Nth.minus=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s1)],
+    Delta=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.delta)],
+    Nth.minus.plus.Delta=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s1 + tumour.frac.delta)]
+  )
+
+summary(m[[which.min(sapply(m, AIC))]])
+
+AICs <- lapply(m, AIC)
+```
+
+
+```{r}
+models <- suppressWarnings(lapply(0:9, function(i){
+  x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2 > i*0.1)]
+}))
+models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2 == 1)]
+models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2)]
+names(models) <- c(paste0("threshold=",0:10/10),"continuous")
+
+sort(sapply(models, AIC))
+best.model <- models[[which.min(lapply(models, AIC))]]
+summary(best.model)
+
+new.dat <- data.table(tumour.frac.s2=(0:5)/5)
+fit <- survfit(best.model, newdata = new.dat)
+ggsurvplot(fit, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat )
+```
+
+## (Nth) vs (Nth-1) Sample
+
+```{r}
+x <- rbindlist(lapply(2:5,function(i){
+  x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+  x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+  x <- x[,.(patient.ID,date,RECIST)]
+  x <- x[!is.na(RECIST)]
+  
+  p.subset <- detect$ichorCNA.summary[Sample.type=="ctDNA",.N,Patient.ID][N>=i,Patient.ID]
+  x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",tail(head(.SD,i-1),1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s1=1-n_est,first.blood=Date.collected)])
+  x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",tail(head(.SD,i),1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s2=1-n_est,second.blood=Date.collected)])
+
+  x <- x[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+  
+  x[,days.till.PD:=round(difftime(as.Date(date,"%d/%m/%y"),second.blood,units="days"))]
+  x <- x[days.till.PD>0]
+  x[,tumour.frac.delta:=tumour.frac.s2-tumour.frac.s1]
+  
+  list(
+    Nth.minus=x[,AIC(coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s1))],
+    Nth=x[,AIC(coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2))],
+    Delta=x[,AIC(coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.delta))],
+    Nth.minus.plus.Delta=x[,AIC(coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s1 + tumour.frac.delta))]
+  )
+}))
+x$sample <- 2:5
+x <- melt(x,id.vars = "sample")
+
+x[,.SD[which.min(value)],sample]
+
+x[order(value),best.model:=c(TRUE,rep(FALSE,(.N-1))),sample]
+ggplot(x) + aes(x=variable,y=value,fill=best.model) + geom_col() + facet_wrap(~sample,scales = "free") + theme_minimal() + theme(axis.text = element_text(angle=90,hjust = 1))
+```
+
+## (Nth) Threshold
+
+```{r}
+x <- rbindlist(lapply(1:6,function(i){
+  x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+  x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+  x <- x[,.(patient.ID,date,RECIST)]
+  x <- x[!is.na(RECIST)]
+  
+  p.subset <- detect$ichorCNA.summary[Sample.type=="ctDNA",.N,Patient.ID][N>=i,Patient.ID]
+  x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",tail(head(.SD,i),1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s2=1-n_est,second.blood=Date.collected)])
+
+  x[,days.till.PD:=round(difftime(as.Date(date,"%d/%m/%y"),second.blood,units="days"))]
+  x <- x[days.till.PD>0]
+  
+  x <- x[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+  
+  models <- suppressWarnings(lapply(0:9, function(i){
+    x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2 > i*0.1)]
+  }))
+  models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2 == 1)]
+  models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2)]
+  names(models) <- c(paste0("threshold=",0:10/10),"continuous")
+
+  lapply(models, AIC)
+}))
+x$sample <- 1:6
+
+x <- melt(x,id.vars = "sample")
+
+x[,.SD[which.min(value)],sample]
+
+x[order(value),best.model:=c(TRUE,rep(FALSE,(.N-1))),sample]
+ggplot(x) + aes(x=variable,y=value,fill=best.model) + geom_col() + facet_wrap(~sample,scales = "free") + theme_minimal() + theme(axis.text = element_text(angle=90,hjust = 1))
+```
+
+## Andersen-Gill model
+
+### First replase
+```{r}
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%y")]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA" & !is.na(Date.collected),.(head(Date.collected,-1),tail(Date.collected,-1),head(n_est,-1)),.(patient.ID=Patient.ID)]
+x <- merge(x,y)
+x <- x[,.(start=floor(difftime(V1,min(V1),units="days")),end=floor(difftime(V2,min(V1),units="days")),event.date=floor(difftime(date,min(V1),units="days")),tumour.frac=1-V3,RECIST),patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID",all.x=T)
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+# Construct models with extra vars
+thresholds <- 0:99 * 0.01
+models <- suppressWarnings(lapply(thresholds, function(thr){
+  x[,coxph(Surv(start,end,event) ~ ER.status + Brain.Tumour + (tumour.frac > thr))]
+}))
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ER.status + Brain.Tumour + tumour.frac)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ER.status + Brain.Tumour)]
+
+# Construct models without extra vars
+models <- c(models,suppressWarnings(lapply(thresholds, function(thr){
+  x[,coxph(Surv(start,end,event) ~ (tumour.frac > thr))]
+})))
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~  tumour.frac)]
+
+names(models) <- c(paste0("ER.Brain.",c(paste0("threshold.",thresholds),"continuous","No.Tumour")),c(paste0("threshold.",thresholds),"continuous"))
+
+# Model selection
+AICs <- sapply(models, AIC)
+AICs.sorted <- as.data.table(sort(AICs),keep.rownames = T)
+AICs.sorted[,prob:=exp((V2[1]-V2)/2)]
+AICs.sorted[prob>0.01]
+
+fit <- models[[which.min(AICs)]]
+print(summary(fit))
+# Predictions
+if ("ER.statusPositive" %in% names(models[[which.min(AICs)]]$coefficients)){
+  new.dat <- data.table(tumour.frac=(0:5)/5,ER.status="Positive")
+  pred <- survfit(fit, newdata = new.dat)
+  g1 <- ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat,title="ER+")
+  
+  new.dat <- data.table(tumour.frac=(0:5)/5,ER.status="Negative")
+  pred <- survfit(fit, newdata = new.dat)
+  g2 <- ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat,title="ER-")
+  
+  arrange_ggsurvplots(list(g1,g2),print = TRUE, ncol = 2, nrow = 1)
+} else {
+  new.dat <- data.table(tumour.frac=(0:5)/10)
+  pred <- survfit(fit, newdata = new.dat)
+  ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=new.dat$tumour.frac,data=new.dat)
+}
+```
+
+```{r}
+new.dat <- data.table(tumour.frac=(0:1)/10)
+pred <- survfit(fit, newdata = new.dat)
+ggsurvplot(pred, conf.int = F,ggtheme = theme_tufte(20),legend.labs=c("<7%","\u22657%"),data=new.dat)$plot + scale_x_continuous(breaks=seq(0,365,60)) + xlim(0,365) + labs(x="Days",y="Progression Free\nSurvival Probability") + scale_color_discrete(name="ichorCNA.TF")
+```
+
+
+```{R,eval=F}
+library(chngpt)
+models <- list(
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="hinge"),
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="step"),
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="segmented"),
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="stegmented")
+)
+sapply(models, function(m) AIC(m$best.fit))
+```
+
+
+```{r}
+m <- x[,coxph(Surv(start,end,event) ~  pspline(tumour.frac,df=0))]
+AIC(m)
+termplot(m, se=TRUE, col.term=1, col.se=1)
+new.dat <- data.table(tumour.frac=(0:5)/10)
+pred <- survfit(m, newdata = new.dat)
+ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=new.dat$tumour.frac,data=new.dat)
+```
+
+```{r}
+models <- lapply(0:99, function(i){
+  chngptm(formula.1=Surv(start,end,event)~(tumour.frac>(i*0.01)), formula.2=~tumour.frac, data=x, family="coxph",type="step")
+})
+AICs <- rbindlist(lapply(0:99, function(i)
+  list(
+    chngpt.1=i*0.01,
+    chngpt.2=models[[i+1]]$chngpt,
+    AIC=AIC(models[[i+1]]$best.fit)
+  )
+))
+AICs[order(AIC)][1:10]
+```
+
+
+### Multiple relapses
+
+```{r}
+detect$RECIST[scan.id!="B",abs(diff(as.numeric(factor(RECIST=="PD")))),patient.ID][,ceiling(sum(V1)/2),patient.ID][V1>1]
+```
+
+# Treament Boundries
+
+```{r}
+get.treat.bound <- function(){
+  treat.bound <- detect$treatment[, unique(sort(as.Date(c(start.date,end.date),"%d/%m/%y"))), patient.ID]
+  treat.bound <- rbindlist(lapply(1:nrow(treat.bound), function(i){
+    y <- treat.bound[i]
+    data.table(t(c(
+      patient.ID=y$patient.ID,
+      treatment.boundry=format(y$V1, "%d-%b-%y"),
+      detect$RECIST[patient.ID==y$patient.ID & as.Date(date,"%d/%m/%y") <= y$V1,][.N,.(
+        preCT.date=as.numeric(as.Date(date,"%d/%m/%y") - y$V1),
+        preCT.RECIST=RECIST)],
+      detect$RECIST[patient.ID==y$patient.ID & as.Date(date,"%d/%m/%y")>y$V1,][1,.(
+        postCT.date=as.numeric(as.Date(date,"%d/%m/%y") - y$V1),
+        postCT.RECIST=RECIST)],
+      detect$ichorCNA.summary[Patient.ID==y$patient.ID & as.Date(Date.collected) <= y$V1 & Sample.type=="ctDNA",][.N,.(
+        preBL.date=as.numeric(as.Date(Date.collected) - y$V1),
+        preBL.tumour=1-n_est)],
+      detect$ichorCNA.summary[Patient.ID==y$patient.ID & as.Date(Date.collected)>y$V1 & Sample.type=="ctDNA",][1,.(
+        postBL.date=as.numeric(as.Date(Date.collected) - y$V1),
+        postBL.tumour=1-n_est)]
+    )))
+  }))
+  treat.bound <- treat.bound[apply(treat.bound, 1, function(x) length(unlist(x))==10)]
+  treat.bound <- treat.bound[rowSums(is.na(treat.bound))==0]
+  treat.bound <- data.table(apply(treat.bound,2,unlist))
+  
+  treat.bound[preCT.RECIST=="NMD",preCT.RECIST:="CR"]
+  treat.bound[postCT.RECIST=="NMD",postCT.RECIST:="CR"]
+  treat.bound$preCT.RECIST <- factor(treat.bound$preCT.RECIST,levels=c("CR","PR","SD","PD"),ordered = T)
+  treat.bound$postCT.RECIST <- factor(treat.bound$postCT.RECIST,levels=c("CR","PR","SD","PD"),ordered = T)
+  
+  treat.bound[,preBL.tumour:=as.numeric(preBL.tumour)]
+  treat.bound[,postBL.tumour:=as.numeric(postBL.tumour)]
+  treat.bound[,tumour.dif:=postBL.tumour - preBL.tumour]
+  
+  return(treat.bound)
+}
+```
+
+```{r}
+treat.bound <- get.treat.bound()
+time.dist <- data.table(melt(treat.bound,id.vars = 1:2,measure.vars = c(3,5,7,9)))
+ggplot(time.dist) + aes(x=abs(as.numeric(value))/28) + geom_step(aes(y=..y..),stat="ecdf") + facet_wrap(~variable) + xlab("Months")
+```
+
+## Ordinal Logistic
+
+### 6m time limit
+
+```{r}
+treat.bound <- get.treat.bound()
+time.limit <- 6 * 28
+
+nrow(treat.bound)
+treat.bound <- treat.bound[ rowSums(abs(apply(treat.bound[,.(preCT.date,postCT.date,preBL.date,postBL.date)],2,as.numeric)) > time.limit) == 0 ]
+nrow(treat.bound)
+
+models <- list(
+  tumour.dif = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + tumour.dif, Hess = T)],
+  tumour.post = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + postBL.tumour, Hess = T)],
+  tumour.pre = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + preBL.tumour, Hess = T)],
+  tumour.all = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + preBL.tumour + postBL.tumour, Hess = T)]
+)
+sapply(models,AIC)
+m <- models[[which.min(sapply(models,AIC))]]
+summary(m)
+
+ctable <- coef(summary(m))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+(ctable <- cbind(ctable, "p value" = p))
+(ci <- confint(m))
+exp(cbind(OR = coef(m), ci))
+```
+
+```{r}
+newdat <- data.table(
+  preCT.RECIST = rep(c("CR","PR","SD","PD"),each=101),
+  postBL.tumour = rep(0:100/100, 4))
+newdat <- cbind(newdat, predict(m, newdat, type = "probs"))
+newdat <- melt(newdat,id.vars = 1:2,variable.name = "postCT.RECIST",value.name = "Probability")
+newdat$preCT.RECIST <- factor(newdat$preCT.RECIST,levels = c("CR","PR","SD","PD"))
+ggplot(newdat) + aes(x = postBL.tumour, y = Probability, colour = postCT.RECIST) + geom_line() + facet_wrap(~ preCT.RECIST,labeller="label_both") + scale_colour_brewer(palette = "Spectral",direction = -1) + theme_bw()
+```
+
+### 12m time limit
+
+```{r}
+treat.bound <- get.treat.bound()
+time.limit <- 12 * 28
+
+nrow(treat.bound)
+treat.bound <- treat.bound[ rowSums(abs(apply(treat.bound[,.(preCT.date,postCT.date,preBL.date,postBL.date)],2,as.numeric)) > time.limit) == 0 ]
+nrow(treat.bound)
+
+models <- list(
+  tumour.dif = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + tumour.dif, Hess = T)],
+  tumour.post = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + postBL.tumour, Hess = T)],
+  tumour.pre = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + preBL.tumour, Hess = T)],
+  tumour.all = treat.bound[,polr(postCT.RECIST ~ preCT.RECIST + preBL.tumour + postBL.tumour, Hess = T)]
+)
+sapply(models,AIC)
+m <- models[[2]]
+summary(m)
+
+ctable <- coef(summary(m))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+(ctable <- cbind(ctable, "p value" = p))
+(ci <- confint(m))
+exp(cbind(OR = coef(m), ci))
+```
+
+```{r}
+newdat <- data.table(
+  preCT.RECIST = rep(c("CR","PR","SD","PD"),each=101),
+  postBL.tumour = rep(0:100/100, 4))
+newdat <- cbind(newdat, predict(m, newdat, type = "probs"))
+newdat <- melt(newdat,id.vars = 1:2,variable.name = "postCT.RECIST",value.name = "Probability")
+newdat$preCT.RECIST <- factor(newdat$preCT.RECIST,levels = c("CR","PR","SD","PD"))
+ggplot(newdat) + aes(x = postBL.tumour, y = Probability, colour = postCT.RECIST) + geom_line() + facet_wrap(~ preCT.RECIST,labeller="label_both") + scale_colour_brewer(palette = "Spectral",direction = -1) + theme_bw()
+```
+
+
+
+## Logistic model
+
+### 6m time limit
+
+```{r}
+library(ROCR)
+
+treat.bound <- get.treat.bound()
+time.limit <- 6 * 28
+
+nrow(treat.bound)
+treat.bound <- treat.bound[ rowSums(abs(apply(treat.bound[,.(preCT.date,postCT.date,preBL.date,postBL.date)],2,as.numeric)) > time.limit) == 0 ]
+treat.bound[,preCT.RECIST:=factor(ifelse(preCT.RECIST=="PD","PD","!PD"))]
+treat.bound[,postCT.RECIST:=factor(ifelse(postCT.RECIST=="PD","PD","!PD"))]
+nrow(treat.bound)
+
+models <- list(
+  tumour.dif = treat.bound[,glm(postCT.RECIST ~ preCT.RECIST + tumour.dif, family = binomial)],
+  tumour.post = treat.bound[,glm(postCT.RECIST ~ preCT.RECIST + postBL.tumour, family = binomial)],
+  tumour.pre = treat.bound[,glm(postCT.RECIST ~ preCT.RECIST + preBL.tumour, family = binomial)],
+  tumour.all = treat.bound[,glm(postCT.RECIST ~ preCT.RECIST + preBL.tumour + postBL.tumour, family = binomial)]
+)
+sapply(models,AIC)
+summary(models[[which.min(sapply(models,AIC))]])
+
+preds <- rbindlist(lapply(models,function(m){
+  pred <- predict(m, type = 'response')
+  ROCpred <- prediction(pred,treat.bound$postCT.RECIST)
+  ROCperf <- performance(ROCpred, 'tpr','fpr')
+  data.table("fpr"=ROCperf@x.values[[1]],"tpr"=ROCperf@y.values[[1]])
+}),idcol = "predictor")
+
+ggplot(preds) + aes(x=fpr,y=tpr,col=predictor) + geom_line(size=2) + theme_bw(20)
+
+lapply(models, function(m){
+  pred <- predict(m, type = 'response')
+  pred <- prediction(pred,treat.bound$postCT.RECIST)
+  perf <- performance(pred, "acc")
+  i <- which.max(perf@y.values[[1]])
+  c(perf@x.values[[1]][i],perf@y.values[[1]][i])
+})
+
+```
+
+```{r}
+treat.bound <- get.treat.bound()
+time.limit <- 6 * 28
+
+nrow(treat.bound)
+treat.bound <- treat.bound[ rowSums(abs(apply(treat.bound[,.(postCT.date,postBL.date)],2,as.numeric)) > time.limit) == 0 ]
+treat.bound[,postCT.RECIST:=factor(ifelse(postCT.RECIST=="PD","PD","!PD"))]
+nrow(treat.bound)
+
+m <-  treat.bound[,glm(postCT.RECIST ~  postBL.tumour, family = binomial)]
+summary(m)
+
+pred <- predict(m, type = 'response')
+ROCpred <- prediction(pred,treat.bound$postCT.RECIST)
+performance(ROCpred, measure = "auc")
+
+ROCperf <- performance(ROCpred, 'tpr','fpr')
+preds <- data.table("fpr"=ROCperf@x.values[[1]],"tpr"=ROCperf@y.values[[1]])
+ggplot(preds) + aes(x=fpr,y=tpr) + geom_line(size=2) + theme_bw(20)
+
+```
+
+
+
+# Interpolations
+
+## RECIST (EMMA)
+
+```{r}
+pat.subset <- detect$sWG.meta[Sample.type=="ctDNA",.(Patient.ID,Sample.num)][,.N,Patient.ID][order(N)][N>1,Patient.ID]
+x <- unique(detect$RECIST[scan.id!="B"][patient.ID %in% pat.subset,.(patient.ID,scan.id,date,value=RECIST)])[,.(patient.ID,date=as.Date(date,"%d/%m/%y"),variable="RECIST",value)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="ichorCNA.tumour.frac",value)]
+
+z <- rbindlist(lapply(unique(x[,patient.ID]), function(p.ID){
+  dates <- x[patient.ID==p.ID,date]
+  z <- data.table(patient.ID=p.ID,
+                  date=dates,
+                  RECIST=x[patient.ID==p.ID,value],
+                  ichorCNA.tumour.frac=y[patient.ID==p.ID,approx(date,value,xout=dates)$y]
+                  )
+  return(z)
+}))
+
+z$RECIST <- factor(z$RECIST,levels = c("CR","NMD","PR","SD","PD","SD.brain","PD.brain"))
+
+ggplot(z) + aes(x=RECIST,y=ichorCNA.tumour.frac) + geom_boxplot()
+```
+
+## CT Tumour Volumes
+
+```{r}
+pat.subset.RECIST <- unique(detect$RECIST[scan.id!="B",.(patient.ID,scan.id)])[,.N,patient.ID][order(N)][N>1,patient.ID]
+pat.subset.ctDNA <- detect$sWG.meta[Sample.type=="ctDNA",.(Patient.ID,Sample.num)][,.N,Patient.ID][order(N)][N>1,Patient.ID]
+pat.subset <- intersect(pat.subset.RECIST,pat.subset.ctDNA)
+
+x <- detect$RECIST[patient.ID %in% pat.subset,.(value=sum(size,na.rm=T)),.(patient.ID,scan.id,date)][,.(patient.ID,date=as.Date(date,"%d/%m/%y"),variable="RECIST",value)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="ichorCNA.tumour.frac",value)]
+z <- detect$z.OR.score[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=z.OR),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="z.OR",value)]
+
+z <- rbindlist(lapply(unique(x[,patient.ID]), function(p.ID){
+  dates <- sort(c(y[patient.ID==p.ID,date],x[patient.ID==p.ID,date]))
+  z <- data.table(patient.ID=p.ID,
+                  date=dates,
+                  RECIST=x[patient.ID==p.ID,approx(date,value,xout=dates)$y],
+                  ichorCNA.tumour.frac=y[patient.ID==p.ID,approx(date,value,xout=dates)$y],
+                  z.OR=z[patient.ID==p.ID,approx(date,value,xout=dates)$y]
+                  )
+  return(z)
+}))
+z <- z[!is.na(RECIST) & !is.na(ichorCNA.tumour.frac)]
+
+ggpairs(z,columns = 3:5)
+z[,.(ichorCNA.cor=cor(RECIST,ichorCNA.tumour.frac,use = "pairwise.complete"),z.OR.cor=cor(z.OR,RECIST,use = "pairwise.complete"))]
+z[,.(.N,ichorCNA.cor=cor(RECIST,ichorCNA.tumour.frac,use = "pairwise.complete"),z.OR.cor=cor(z.OR,RECIST,use = "pairwise.complete")),patient.ID]
+table(z[,.(.N,cor(RECIST,ichorCNA.tumour.frac,use = "pairwise.complete") - cor(z.OR,RECIST,use = "pairwise.complete")),patient.ID][,V2>0])
+```
+
+## CT Tumour Volumes (shifted)
+
+```{r}
+pat.subset.RECIST <- unique(detect$RECIST[scan.id!="B",.(patient.ID,scan.id)])[,.N,patient.ID][order(N)][N>1,patient.ID]
+pat.subset.ctDNA <- detect$sWG.meta[Sample.type=="ctDNA",.(Patient.ID,Sample.num)][,.N,Patient.ID][order(N)][N>1,Patient.ID]
+pat.subset <- intersect(pat.subset.RECIST,pat.subset.ctDNA)
+
+x <- detect$RECIST[patient.ID %in% pat.subset,.(value=sum(size,na.rm=T)),.(patient.ID,scan.id,date)][,.(patient.ID,date=as.Date(date,"%d/%m/%y"),variable="RECIST",value)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="ichorCNA.tumour.frac",value)]
+z <- detect$z.OR.score[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=z.OR),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="z.OR",value)]
+
+x <- x[,.(variable,date,value=value-head(value,1)),patient.ID]
+y <- y[,.(variable,date,value=value-head(value,1)),patient.ID]
+z <- z[,.(variable,date,value=value-head(value,1)),patient.ID]
+
+z <- rbindlist(lapply(unique(x[,patient.ID]), function(p.ID){
+  dates <- sort(c(y[patient.ID==p.ID,date],x[patient.ID==p.ID,date]))
+  z <- data.table(patient.ID=p.ID,
+                  date=dates,
+                  RECIST=x[patient.ID==p.ID,approx(date,value,xout=dates)$y],
+                  ichorCNA.tumour.frac=y[patient.ID==p.ID,approx(date,value,xout=dates)$y],
+                  z.OR=z[patient.ID==p.ID,approx(date,value,xout=dates)$y]
+                  )
+  return(z)
+}))
+z <- z[!is.na(RECIST) & !is.na(ichorCNA.tumour.frac)]
+
+ggpairs(z,columns = 3:5)
+z[,.(ichorCNA.cor=cor(RECIST,ichorCNA.tumour.frac,use = "pairwise.complete"),z.OR.cor=cor(z.OR,RECIST,use = "pairwise.complete"))]
+z[,.(.N,ichorCNA.cor=cor(RECIST,ichorCNA.tumour.frac,use = "pairwise.complete"),z.OR.cor=cor(z.OR,RECIST,use = "pairwise.complete")),patient.ID]
+table(z[,.(.N,cor(RECIST,ichorCNA.tumour.frac,use = "pairwise.complete") - cor(z.OR,RECIST,use = "pairwise.complete")),patient.ID][,V2>0])
+```
+
+
+
+## Tumour Volumes
+
+```{r}
+pat.subset.RECIST <- unique(detect$RECIST[,.(patient.ID,scan.id)])[,.N,patient.ID][order(N)][N>1,patient.ID]
+pat.subset.ctDNA <- detect$sWG.meta[Sample.type=="ctDNA",.(Patient.ID,Sample.num)][,.N,Patient.ID][order(N)][N>1,Patient.ID]
+pat.subset <- intersect(pat.subset.RECIST,pat.subset.ctDNA)
+
+x <- detect$RECIST[patient.ID %in% pat.subset,.(value=sum(size,na.rm=T)),.(patient.ID,scan.id,date)][,.(patient.ID,date=as.Date(date,"%d/%m/%y"),variable="RECIST",value)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="ichorCNA.tumour.frac",value)]
+
+
+z <- rbindlist(lapply(unique(x[,patient.ID]), function(p.ID){
+  dates <- sort(c(y[patient.ID==p.ID,date],x[patient.ID==p.ID,date]))
+  z <- data.table(patient.ID=p.ID,
+                  date=dates,
+                  Tumour.volume=x[patient.ID==p.ID,approx(date,value,xout=dates)$y],
+                  ichorCNA.tumour.frac=y[patient.ID==p.ID,approx(date,value,xout=dates)$y]
+                  )
+  return(z)
+}))
+z <- z[!is.na(Tumour.volume) & !is.na(ichorCNA.tumour.frac)]
+z[order(patient.ID,date),Tumour.volume.shifted:=c(NA,tail(Tumour.volume-head(Tumour.volume,1),-1)),patient.ID]
+z[order(patient.ID,date),ichorCNA.tumour.frac.shifted:=c(NA,tail(ichorCNA.tumour.frac-head(ichorCNA.tumour.frac,1),-1)),patient.ID]
+
+z <- z[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+
+m <- z[,lm(Tumour.volume~ichorCNA.tumour.frac)]
+summary(m)
+
+m <- z[!is.na(ichorCNA.tumour.frac.shifted),lm(Tumour.volume~ichorCNA.tumour.frac)]
+summary(m)
+
+m <- z[,lm(Tumour.volume.shifted~0 + ichorCNA.tumour.frac.shifted)]
+summary(m)
+```
+
+
+## RECIST
+
+```{r}
+pat.subset <- detect$sWG.meta[Sample.type=="ctDNA",.(Patient.ID,Sample.num)][,.N,Patient.ID][order(N)][N>1,Patient.ID]
+x <- unique(detect$RECIST[scan.id!="B"][patient.ID %in% pat.subset,.(patient.ID,scan.id,date,value=RECIST)])[,.(patient.ID,date=as.Date(date,"%d/%m/%y"),variable="RECIST",value)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="ichorCNA.tumour.frac",value)]
+
+z <- rbindlist(lapply(unique(x[,patient.ID]), function(p.ID){
+  dates <- x[patient.ID==p.ID,date]
+  z <- data.table(patient.ID=p.ID,
+                  date=dates,
+                  RECIST=x[patient.ID==p.ID,value],
+                  ichorCNA.tumour.frac=y[patient.ID==p.ID,approx(date,value,xout=dates)$y]
+                  )
+  return(z)
+}))
+
+z <- z[!is.na(RECIST) & !is.na(ichorCNA.tumour.frac)]
+z <- z[!(patient.ID %in% z[RECIST %in% c("SD.brain","PD.brain"),patient.ID])]
+
+z[RECIST=="NMD",RECIST:="CR"]
+z$RECIST <- factor(z$RECIST,levels = c("CR","PR","SD","PD"))
+
+z[,patient.ID:=factor(patient.ID)]
+z[order(patient.ID,date),ichorCNA.tumour.frac.shifted:=c(NA,tail(ichorCNA.tumour.frac-head(ichorCNA.tumour.frac,1),-1)),patient.ID]
+z[order(patient.ID,date),ichorCNA.tumour.frac.t0:=head(ichorCNA.tumour.frac,1),patient.ID]
+
+z <- z[!is.na(ichorCNA.tumour.frac.shifted)]
+z <- z[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+
+m <- list(
+  "tumour.frac"=z[,polr(RECIST ~ ichorCNA.tumour.frac,Hess = T)],
+  "tumour.frac.shifted"=z[,polr(RECIST ~ ichorCNA.tumour.frac.shifted,Hess = T)],
+  "tumour.frac.shifted.plus.intercept"=z[,polr(RECIST ~ ichorCNA.tumour.frac.shifted + ichorCNA.tumour.frac.t0,Hess = T)]
+)
+
+c <- lapply(m, function(x){
+  ctable <- coef(summary(x))
+  p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+  ctable <- cbind(ctable, "p value" = p)
+  ctable
+})
+
+sapply(m, AIC)
+c[[which.min(sapply(m, AIC))]]
+```
+
+```{r}
+best.model <- m[[which.min(sapply(m, AIC))]]
+pr <- cbind(data.table("ichorCNA.tumour.frac"=factor((0:100)/100)),predict(best.model,data.table(ichorCNA.tumour.frac=(0:100)/100), type = "probs"))
+pr <- melt(pr,id.vars="ichorCNA.tumour.frac")
+ggplot(pr) + aes(x=as.numeric(ichorCNA.tumour.frac),y=value,colour=variable) + geom_line() + theme_tufte(12)
+```
+
+```{r}
+x <- cbind(z[,.(RECIST)],predict(best.model,z[,.(ichorCNA.tumour.frac)]))
+ggplot(x) + aes(x=RECIST,fill=V2) + geom_bar() + theme_tufte(20) + scale_fill_manual(values=c("CR"= "lightskyblue","PR"="paleturquoise","SD"="lightgreen","PD"="palevioletred"))
+table(x)
+sum(diag(table(x)))/nrow(x)
+```
+
+## RECIST (PD only)
+
+```{r}
+pat.subset <- detect$sWG.meta[Sample.type=="ctDNA",.(Patient.ID,Sample.num)][,.N,Patient.ID][order(N)][N>1,Patient.ID]
+x <- unique(detect$RECIST[scan.id!="B"][patient.ID %in% pat.subset,.(patient.ID,scan.id,date,value=RECIST)])[,.(patient.ID,date=as.Date(date,"%d/%m/%y"),variable="RECIST",value)]
+y <- detect$ichorCNA.summary[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(value=1-n_est),.(patient.ID=Patient.ID,Sample.num,date=Date.collected)][,.(patient.ID,date=as.Date(date),variable="ichorCNA.tumour.frac",value)]
+
+z <- rbindlist(lapply(unique(x[,patient.ID]), function(p.ID){
+  dates <- x[patient.ID==p.ID,date]
+  z <- data.table(patient.ID=p.ID,
+                  date=dates,
+                  RECIST=x[patient.ID==p.ID,value],
+                  ichorCNA.tumour.frac=y[patient.ID==p.ID,approx(date,value,xout=dates)$y]
+                  )
+  return(z)
+}))
+
+z <- z[!is.na(RECIST) & !is.na(ichorCNA.tumour.frac)]
+z <- z[!(patient.ID %in% z[RECIST %in% c("SD.brain","PD.brain"),patient.ID])]
+
+z[RECIST!="PD",RECIST:="Non-PD"]
+z$RECIST <- factor(z$RECIST,levels = c("Non-PD","PD"))
+
+z[,patient.ID:=factor(patient.ID)]
+z[order(patient.ID,date),ichorCNA.tumour.frac.shifted:=c(NA,tail(ichorCNA.tumour.frac-head(ichorCNA.tumour.frac,1),-1)),patient.ID]
+z[order(patient.ID,date),ichorCNA.tumour.frac.t0:=head(ichorCNA.tumour.frac,1),patient.ID]
+
+z <- z[!is.na(ichorCNA.tumour.frac.shifted)]
+z <- z[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+
+m <- list(
+  "tumour.frac"=z[,glm(RECIST ~ ichorCNA.tumour.frac,family=binomial())],
+  "tumour.frac.shifted"=z[,glm(RECIST ~ ichorCNA.tumour.frac.shifted,family=binomial())],
+  "tumour.frac.shifted.plus.intercept"=z[,glm(RECIST ~ ichorCNA.tumour.frac.shifted + ichorCNA.tumour.frac.t0,family=binomial())]
+)
+
+c <- lapply(m, function(x){
+  ctable <- coef(summary(x))
+  p <- pnorm(abs(ctable[, "z value"]), lower.tail = FALSE) * 2
+  ctable <- cbind(ctable, "p value" = p)
+  ctable
+})
+
+sapply(m, AIC)
+c[[which.min(sapply(m, AIC))]]
+```
+
+```{r}
+best.model <- m[[which.min(sapply(m, AIC))]]
+pr <- cbind(data.table("ichorCNA.tumour.frac"=(0:1000)/1000),predict(best.model,data.table(ichorCNA.tumour.frac=(0:1000)/1000), type = "response"))
+ggplot(pr) + aes(x=as.numeric(ichorCNA.tumour.frac),y=V2) + geom_line() + geom_hline(yintercept=0.5,linetype=3) + geom_vline(xintercept=pr[V2>.5][1,ichorCNA.tumour.frac],linetype=3) +  theme_tufte(12)
+```
+
+```{r}
+x <- cbind(z[,.(RECIST)],ifelse(predict(best.model,z[,.(ichorCNA.tumour.frac)],type="response")>.5,"PD","Non-PD"))
+ggplot(x) + aes(x=RECIST,fill=V2) + geom_bar() + theme_tufte(20) + scale_fill_manual(values=c("Non-PD"= "lightskyblue","PD"="palevioletred"))
+table(x)
+sum(diag(table(x)))/nrow(x)
+pred <- prediction(predict(best.model,z[,.(ichorCNA.tumour.frac)],type="response"),z[,.(RECIST)])
+plot(performance(pred,measure="tpr","fpr"))
+```

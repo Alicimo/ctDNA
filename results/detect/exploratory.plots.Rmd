@@ -1,0 +1,394 @@
+---
+title: 'DETECT: ichorCNA on sWG'
+author: "Alistair Martin"
+date: '`r format(Sys.time(), "Last modified: %d %b %Y")`'
+---
+
+# Load/generate data
+
+## Set up
+
+```{r 'setup', message=FALSE, warning=FALSE}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+
+knitr::opts_chunk$set(fig.path = paste0(project.dir,"results/detect/"), dev=c('png', 'pdf'))
+
+pkgs <- c("data.table","ggplot2","ggthemes","GGally","ggbio","gridExtra","ichorCNA","GenomicRanges","survival","survminer",
+          "org.Hs.eg.db","TxDb.Hsapiens.UCSC.hg19.knownGene","BSgenome.Hsapiens.UCSC.hg19","grid","pheatmap")
+pkgs <- lapply(pkgs,function(pkg) suppressWarnings(suppressMessages(require(pkg, ch = TRUE))))
+                                  
+source(paste0(project.dir,"src/ichorCNA.wrapper.R"))
+source(paste0(project.dir,"src/ABSOLUTE.wrapper.R"))
+source(paste0(project.dir,"src/load.detect.R"))
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Org.Db <- org.Hs.eg.db
+
+detect <- detect.load(project.dir)
+detect$sWG.normed <- normalise.ichorCNA(detect$sWG,which(detect$sWG.meta[,Sample.type=="BC"]))
+```
+
+## Run IchorCNA
+
+### Run IchorCNA (default)
+
+```{r}
+ichor.dir <- paste0(project.dir,"data/ichor/ichor.default/")
+env.vars <- get.default.env.vars.ichorCNA()
+x <- run.ichor.pipeline(detect$sWG.normed$cns,env.vars,ichor.dir,verbose = F)
+detect$ichorCNA.summary <- x$summary
+detect$ichorCNA.bestModels <- x$bestModels
+rm(x)
+```
+
+# Clincal metadata
+
+```{r}
+x <- list(
+  "Age at primary diagnosis" = detect$clinical[,.N,.(value=cut(as.numeric(as.Date(pbc_diagnosed_date) - as.Date(birth_date))/365,c(0,40,50,60,70,120)))][order(value)],
+  "Race" = detect$clinical[,.N,.(value=ifelse(grepl("White",ethnicity),"White",ifelse(ethnicity=="Not Stated","Unknown","Nonwhite")))],
+  "Primary receptor status" =detect$clinical[,.N,.(pbc_er_status, pbc_her2_status)][,.(ifelse("Not Known" %in% c(pbc_er_status,pbc_her2_status),"Indeterminate",paste0("ER ",pbc_er_status,", HER2 ",pbc_her2_status)),N),.(N)][,.(N=sum(N)),.(value=V1)],
+  "Grade at primary diagnosis"=detect$clinical[,.(roman=as.roman(as.numeric(pbc_grade)))][,.N,.(value=ifelse(is.na(roman),"Unknown",as.character(roman)))][order(value)],
+  "Vital status" = detect$clinical[,.N,.(value=ifelse(is.na(death_date),"Alive","Deceased"))][order(value)]
+)
+x <- rbindlist(x,idcol = "Measure")
+x[!(c(T,tail(Measure,-1)!=head(Measure,-1))),Measure:=""]
+print(xtable::xtable(x),include.rownames = F)
+```
+
+# Overview on sampling
+
+## Timelines
+
+```{r}
+x <- detect$RECIST$EMMA[,.(sample.date=as.Date(date,"%d/%m/%Y")),patient.ID]
+x <- x[,.(first.date.CT=min(sample.date,na.rm=T),last.date.CT=max(sample.date,na.rm=T)),patient.ID]
+
+y <- detect$sWG.meta[Sample.type=="ctDNA",.(sample.date=as.Date(Date.collected)),.(patient.ID=Patient.ID)]
+y <- y[,.(first.date.BL=min(sample.date,na.rm=T),last.date.BL=max(sample.date,na.rm=T)),patient.ID]
+
+x <- merge(x,y)
+x <- x[,.(first.date=min(first.date.BL,first.date.CT,na.rm=T),last.date=max(last.date.BL,last.date.CT,na.rm=T)),patient.ID]
+
+y <- unique(rbind(
+  detect$RECIST$EMMA[,.(sample.date=as.Date(date,"%d/%m/%Y"),patient.ID,sample.type="CT scan")],
+  detect$sWG.meta[Sample.type=="ctDNA",.(sample.date=as.Date(Date.collected),patient.ID=Patient.ID,sample.type="Plasma taken")]
+))
+x <- merge(x,y)
+x <- x[,.(patient.ID,sample.type,sample.date=sample.date-first.date)]
+x <- x[!is.na(sample.date)]
+
+ x$patient.ID <- factor(x$patient.ID,levels=x[,max(sample.date),patient.ID][order(V1),patient.ID])
+(p <- ggplot(x) + aes(x=patient.ID,y=sample.date) + 
+  geom_line() + geom_point(aes(shape=sample.type,colour=sample.type),size=2) + 
+  labs(y="# of Years",x="Patient ID") +
+  coord_flip() + theme_tufte(20) + theme(legend.position=c(.8, .5),legend.title=element_blank(),axis.ticks = element_blank(), panel.grid.major.x = element_line(colour = "grey50",linetype="dashed"),legend.background = element_rect(fill = "white",colour = "grey90"),axis.text.y = element_text(size=12)) + scale_y_continuous(breaks = 365*1:6,labels = 1:6))
+ ggsave("~/Desktop/Detect.sampling.png",p,dpi=300,height=7,width=6)
+```
+
+## N Samples
+
+```{r}
+x <- detect$RECIST$EMMA[,.(patient.ID,scan.id)][,.(CT.N=.N),patient.ID]
+y <- detect$sWG.meta[Sample.type=="ctDNA",.(BC.N=.N),.(patient.ID=Patient.ID)]
+x <- melt(merge(x,y,all=T),id.vars = 1)
+levels(x$variable) <- c("# of CT Scans", "# of Plasma Samples")
+ggplot(x) + aes(x=value,fill=variable) + geom_bar() + facet_wrap(~variable) + theme_bw() + labs(x="Count",y="# of Patients") + theme(legend.position = "None")
+```
+
+# Timecourse for each patient
+
+## ichorCNA.default, RECIST (Emma), & Treatment
+
+```{r}
+#Only patients with 2 ctDNA samples
+pat.subset <- detect$sWG.meta[Sample.type=="ctDNA",.N,Patient.ID][order(N)][N>=2,Patient.ID]
+#pat.subset <- c(81)
+
+#Get relevant ichorCNA tumour estimates
+x <- merge(detect$sWG.meta,detect$ichorCNA.summary,by="Sample.name")
+x <- x[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(ichorCNA.Tumour.Frac=(1-n_est)*100),.(patient.ID=Patient.ID,scan.id=Sample.num,date=Date.collected)]
+x[,date:=as.Date(date)]
+x <- x[!is.na(date)]
+
+#Get relevant treatment data
+y <- detect$treatment[patient.ID %in% pat.subset,.(patient.ID,date.start=start.date,date.end=end.date,treatment)]
+#remove any treatments that start after the final ctDNA sample was taken
+y <- rbindlist(lapply(pat.subset,function(p.ID) y[patient.ID == p.ID & date.start<x[patient.ID == p.ID, max(date)]] ))
+#remove OFF treatment entries
+y <- y[treatment!="OFF"]
+#set the end date of final treatment to date of final ctDNA sample
+for(p.ID in pat.subset) y[patient.ID == p.ID & (is.na(date.end) | date.end>x[patient.ID == p.ID, max(date)]),date.end:=x[patient.ID == p.ID, max(date)]] 
+
+#Get the CT Recist calls (Emma)
+z <- detect$RECIST$EMMA[patient.ID %in% pat.subset,.(date=as.Date(date,"%d/%m/%Y"),RECIST,patient.ID)]
+#remove any CT scans that occur after final ctDNA sample was taken
+z <- rbindlist(lapply(pat.subset,function(p.ID) z[patient.ID == p.ID & date<x[patient.ID == p.ID, max(date)]] ))
+#Relabel NMD to two letters for plotting purposes
+z[RECIST=="NMD",RECIST:="NM"]
+
+#for(p.ID in pat.subset) z[patient.ID == p.ID,date.end:= c(head(date.end,-1),x[patient.ID == p.ID, max(date)])]
+
+for(p.ID in pat.subset){
+  y.max <- max(x[patient.ID==p.ID,ichorCNA.Tumour.Frac])
+  if(y.max == 0) y.max <- 0.1
+  
+  p <- ggplot()
+  
+  if(nrow(y[patient.ID==p.ID])){
+    if(nrow(y[patient.ID==p.ID & date.start!=date.end])){
+      y.sub <- y[patient.ID==p.ID & date.start!=date.end]
+      y.sub$treatment <- factor(y.sub$treatment,levels = unique(y.sub$treatment))
+      p <- p + 
+        geom_rect(data=y.sub,aes(xmin=date.start,xmax=date.end, ymin = -Inf, ymax = Inf,fill = treatment),alpha=0.5) +
+        scale_fill_brewer(palette = "Set3",name="Treatment")
+    }
+    if(nrow(y[patient.ID==p.ID & date.start==date.end])){
+      y.sub <- y[patient.ID==p.ID & date.start==date.end]
+      p <- p + geom_vline(data=y.sub,aes(xintercept=date.start,linetype=treatment)) +
+        scale_linetype_manual(values=c("twodash", "dotted","longdash"),name="One Day\nTreatment")
+    }
+  } 
+    
+  p <- p +
+    geom_line(data=x[patient.ID==p.ID],aes(x=date,y=ichorCNA.Tumour.Frac)) +
+    geom_label(data=x[patient.ID==p.ID],aes(x=date,y=ichorCNA.Tumour.Frac,label=scan.id)) +
+    ylim(0,y.max)
+  
+  p <- p +
+    labs(title=" ",tag=paste("Patient:",p.ID)) +
+    theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  
+  if(z[patient.ID==p.ID,.N]){ 
+    for(i in 1:nrow(z[patient.ID==p.ID])){
+      ds <- z[patient.ID==p.ID][i,date]
+      R <- z[patient.ID==p.ID][i,RECIST]
+      p <- p + 
+        annotation_custom(segmentsGrob(gp = gpar(col = "black", lwd = 2)),xmin=ds,xmax=ds,ymin=y.max+(0.02*y.max),ymax=y.max+(0.06*y.max)) +
+        annotation_custom(textGrob(R, gp = gpar(col = "black"),rot=-90,hjust=2),xmin=ds,xmax=ds,ymin=y.max,ymax=y.max)
+    }
+  }
+  
+  g <- ggplotGrob(p)
+  g$layout$clip[g$layout$name=="panel"] <- "off"
+  
+  #grid.newpage()
+  #grid.draw(g)
+  
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.vs.Emma/",p.ID,".pdf"),width = 10,height = 4)
+  grid.draw(g)
+  dev.off()
+}
+```
+
+## Mutation VAF, RECIST (Emma), & Treatment
+
+```{r}
+#Only patients with 2 ctDNA samples
+pat.subset <- detect$NGTAS.meta[Sample.type=="ctDNA",.N,Patient.ID][order(N)][N>=2,Patient.ID]
+#pat.subset <- c(81)
+
+#Get relevant VAFs
+x <- merge(detect$NGTAS.meta,detect$NGTAS,by="SampleID",all.x=T)
+x <- x[Sample.type=="ctDNA"][Patient.ID %in% pat.subset]
+x[is.na(VAF),VAF:=0]
+x[is.na(mutID),mutID:="No mutation called"]
+x[is.na(Gene.refGene),Gene.refGene:="No mutation called"]
+
+#Get relevant treatment data
+y <- detect$treatment[patient.ID %in% pat.subset,.(patient.ID,date.start=start.date,date.end=end.date,treatment)]
+#remove any treatments that start after the final ctDNA sample was taken
+y <- rbindlist(lapply(pat.subset,function(p.ID) y[patient.ID == p.ID & date.start<x[Patient.ID == p.ID, max(Date.collected)]] ))
+#remove OFF treatment entries
+y <- y[treatment!="OFF"]
+#set the end date of final treatment to date of final ctDNA sample
+for(p.ID in pat.subset) y[patient.ID == p.ID & (is.na(date.end) | date.end>x[Patient.ID == p.ID, max(Date.collected)]),date.end:=x[Patient.ID == p.ID, max(Date.collected)]] 
+
+#Get the CT Recist calls (Emma)
+z <- detect$RECIST$EMMA[patient.ID %in% pat.subset,.(date=as.Date(date,"%d/%m/%Y"),RECIST,patient.ID)]
+#remove any CT scans that occur after final ctDNA sample was taken
+z <- rbindlist(lapply(pat.subset,function(p.ID) z[patient.ID == p.ID & date<x[Patient.ID == p.ID, max(Date.collected)]] ))
+#Relabel NMD to two letters for plotting purposes
+z[RECIST=="NMD",RECIST:="NM"]
+
+
+for(p.ID in pat.subset){
+  y.max <- x[Patient.ID==p.ID,max(VAF,na.rm=T)]
+  if(y.max == 0) y.max <- 0.1
+  
+  p <- ggplot()
+  
+  if(nrow(y[patient.ID==p.ID])){
+    if(nrow(y[patient.ID==p.ID & date.start!=date.end])){
+      y.sub <- y[patient.ID==p.ID & date.start!=date.end]
+      y.sub$treatment <- factor(y.sub$treatment,levels = unique(y.sub$treatment))
+      p <- p + 
+        geom_rect(data=y.sub,aes(xmin=date.start,xmax=date.end, ymin = -Inf, ymax = Inf,fill = treatment),alpha=0.5) +
+        scale_fill_brewer(palette = "Set3",name="Treatment")
+    }
+    if(nrow(y[patient.ID==p.ID & date.start==date.end])){
+      y.sub <- y[patient.ID==p.ID & date.start==date.end]
+      p <- p + geom_vline(data=y.sub,aes(xintercept=date.start,linetype=treatment)) +
+        scale_linetype_manual(values=c("twodash", "dotted","longdash"),name="One Day\nTreatment")
+    }
+  } 
+    
+  p <- p +
+    geom_line(data=x[Patient.ID==p.ID],aes(x=Date.collected,y=VAF,group=mutID,colour=mutID)) +
+    geom_point(data=x[Patient.ID==p.ID],aes(x=Date.collected,y=VAF,group=mutID)) +
+    ylim(0,y.max) + 
+    scale_color_discrete(
+      name="Mutation",
+      breaks=x[Patient.ID==p.ID,unique(mutID)],
+      labels=x[Patient.ID==p.ID,.N,.(mutID,Gene.refGene)][,make.names(Gene.refGene,unique = T)]
+    )
+  
+  p <- p +
+    labs(title=" ",tag=paste("Patient:",p.ID)) +
+    theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+    theme(legend.direction = "vertical", legend.box = "horizontal")
+  
+  if(z[patient.ID==p.ID,.N]){ 
+    for(i in 1:nrow(z[patient.ID==p.ID])){
+      ds <- z[patient.ID==p.ID][i,date]
+      R <- z[patient.ID==p.ID][i,RECIST]
+      p <- p + 
+        annotation_custom(segmentsGrob(gp = gpar(col = "black", lwd = 2)),xmin=ds,xmax=ds,ymin=y.max+(0.02*y.max),ymax=y.max+(0.06*y.max)) +
+        annotation_custom(textGrob(R, gp = gpar(col = "black"),rot=-90,hjust=2),xmin=ds,xmax=ds,ymin=y.max,ymax=y.max)
+    }
+  }
+  
+  g <- ggplotGrob(p)
+  g$layout$clip[g$layout$name=="panel"] <- "off"
+  
+  #grid.newpage()
+  #grid.draw(g)
+  
+  pdf(paste0(project.dir,"results/detect/plots/VAF.vs.Emma/",p.ID,".pdf"),width = 10,height = 4)
+  grid.draw(g)
+  dev.off()
+}
+```
+
+## Mutation VAF, ichorCNA.default, RECIST (Emma), & Treatment
+
+```{r}
+#Only patients with 2 ctDNA samples
+pat.subset <- intersect(
+  detect$NGTAS.meta[Sample.type=="ctDNA",.N,Patient.ID][order(N)][N>=2,Patient.ID],
+  detect$sWG.meta[Sample.type=="ctDNA",.N,Patient.ID][order(N)][N>=2,Patient.ID]
+)
+#pat.subset <- c(81)
+
+#Get relevant VAFs
+x.NGTAS<- merge(detect$NGTAS.meta,detect$NGTAS,by=c("SampleID","Pool"),all.x=T)
+x.NGTAS <- x.NGTAS[Sample.type=="ctDNA"][Patient.ID %in% pat.subset][,.(date=Date.collected,Patient.ID,Sample.num,score=VAF*100,mutID,Gene.refGene,type="NGTAS")]
+x.NGTAS[is.na(score),score:=0]
+x.NGTAS[is.na(score),VAF:=0]
+x.NGTAS[is.na(mutID),mutID:="No mutation called"]
+x.NGTAS[is.na(Gene.refGene),Gene.refGene:="No mutation called"]
+
+#Get relevant ichorCNA tumour estimates
+x.sWG <- merge(detect$sWG.meta,detect$ichorCNA.summary,by="Sample.name")
+x.sWG <- x.sWG[Sample.type=="ctDNA"][Patient.ID %in% pat.subset,.(score=(1-n_est)*100,Patient.ID,Sample.num,date=as.Date(Date.collected),type="sWG")]
+x.sWG <- x.sWG[!is.na(date)]
+
+x <- rbind(x.sWG,x.NGTAS,fill=T)
+
+#Get relevant treatment data
+y <- detect$treatment[patient.ID %in% pat.subset,.(patient.ID,date.start=start.date,date.end=end.date,treatment)]
+#remove any treatments that start after the final ctDNA sample was taken
+y <- rbindlist(lapply(pat.subset,function(p.ID) y[patient.ID == p.ID & date.start<x[Patient.ID == p.ID, max(date)]] ))
+#remove OFF treatment entries
+y <- y[treatment!="OFF"]
+#set the end date of final treatment to date of final ctDNA sample
+for(p.ID in pat.subset) y[patient.ID == p.ID & (is.na(date.end) | date.end>x[Patient.ID == p.ID, max(date)]),date.end:=x[Patient.ID == p.ID, max(date)]] 
+
+#Get the CT Recist calls (Emma)
+z <- detect$RECIST$EMMA[patient.ID %in% pat.subset,.(date=as.Date(date,"%d/%m/%Y"),RECIST,patient.ID)]
+#remove any CT scans that occur after final ctDNA sample was taken
+z <- rbindlist(lapply(pat.subset,function(p.ID) z[patient.ID == p.ID & date<x[Patient.ID == p.ID, max(date)]] ))
+#Relabel NMD to two letters for plotting purposes
+z[RECIST=="NMD",RECIST:="NM"]
+z[,type:="NGTAS"]
+
+for(p.ID in pat.subset){
+  y.max <- x[Patient.ID==p.ID,max(score,na.rm=T)]
+  #if(y.max == 0) y.max <- 0.1
+  
+  p <- ggplot()
+  
+  if(nrow(y[patient.ID==p.ID])){
+    if(nrow(y[patient.ID==p.ID & date.start!=date.end])){
+      y.sub <- y[patient.ID==p.ID & date.start!=date.end]
+      y.sub$treatment <- factor(y.sub$treatment,levels = unique(y.sub$treatment))
+      p <- p + 
+        geom_rect(data=y.sub,aes(xmin=date.start,xmax=date.end, ymin = -Inf, ymax = Inf,fill = treatment),alpha=0.5) +
+        scale_fill_brewer(palette = "Set3",name="Treatment")
+    }
+    if(nrow(y[patient.ID==p.ID & date.start==date.end])){
+      y.sub <- y[patient.ID==p.ID & date.start==date.end]
+      p <- p + geom_vline(data=y.sub,aes(xintercept=date.start,linetype=treatment)) +
+        scale_linetype_manual(values=c("F1", "dotted","longdash"),name="One Day\nTreatment")
+    }
+  } 
+    
+  p <- p +
+    geom_line(data=x[Patient.ID==p.ID],aes(x=date,y=score,group=mutID,colour=mutID)) +
+    geom_point(data=x[Patient.ID==p.ID],aes(x=date,y=score,group=mutID)) +
+    ylim(0,y.max) + 
+    scale_color_discrete(
+      name="Mutation",
+      breaks=x[Patient.ID==p.ID,unique(mutID)],
+      labels=x[Patient.ID==p.ID,.N,.(mutID,Gene.refGene)][,make.names(Gene.refGene,unique = T)]
+    )
+  
+  p <- p +
+    labs(title=" ",tag=paste("Patient:",p.ID)) +
+    theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+    theme(legend.direction = "vertical", legend.box = "horizontal") + facet_grid(type~.)
+  
+  if(z[patient.ID==p.ID,.N]){ 
+    p <- p + geom_vline(data=z[patient.ID==p.ID,.(date)],aes(xintercept=date),linetype="twodash") +
+      geom_label(data=z[patient.ID==p.ID],aes(x=date,y=y.max,label=RECIST),size=3,label.padding =  unit(0.10, "lines"))
+  }
+  
+  g <- ggplotGrob(p)
+  g$layout$clip[g$layout$name=="panel"] <- "off"
+  
+  #grid.newpage()
+  #grid.draw(g)
+  
+  pdf(paste0(project.dir,"results/detect/plots/All.vs.Emma/",p.ID,".pdf"),width = 10,height = 4)
+  grid.draw(g)
+  dev.off()
+}
+```
+
+```{r}
+pat.subset <- detect$NGTAS.meta[Sample.type=="ctDNA",.N,Patient.ID][N>=2,Patient.ID]
+
+x.NGTAS<- merge(detect$NGTAS.meta,detect$NGTAS,by=c("SampleID","Pool"),all.x=T)
+x.NGTAS <- x.NGTAS[Patient.ID %in% pat.subset][,.(Patient.ID,Sample.type,Sample.num,SampleID,Pool,score=VAF*100,mutID)]
+x.NGTAS[is.na(score),score:=0]
+
+for(p.ID in pat.subset){
+  x.sub <- x.NGTAS[Patient.ID==p.ID]
+  x.sub <- dcast(x.sub,SampleID + Pool + Sample.type + Sample.num ~ mutID,value.var = "score")
+  x.sub <- x.sub[order(factor(Sample.type,levels = c("BC","PT","MT","ctDNA")),Sample.num)]
+  x.mat <- round(t(as.matrix(x.sub[,-(1:4),with=F])),1)
+  x.mat.simp <- ifelse(x.mat > 5, 2, ifelse(x.mat>0,1,0))
+  
+  png(paste0(project.dir,"results/detect/plots/VAF.calls/",p.ID,".png"),width=max(25*(nrow(x.mat)+1),250),height=25*ncol(x.mat) + 250)
+  pheatmap(t(x.mat.simp),
+           cluster_cols = F,cluster_rows = F,
+           labels_row = x.sub[,ifelse(Sample.type=="ctDNA",Sample.num,Sample.type)],
+           legend = F, display_numbers = t(x.mat),
+           breaks=c((0:3)-0.5),color=rev(RColorBrewer::brewer.pal(3,"RdYlBu")),
+           cellwidth = 20, cellheight = 20, 
+           border_color = "grey80", main = paste("Patient",p.ID)
+           )
+  dev.off()
+}
+```

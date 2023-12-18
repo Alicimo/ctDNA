@@ -1,0 +1,31 @@
+---
+title: "Measuring tumour dynamics via sWG sequencing of ctDNA"
+author: "Alistair Martin"
+date: "7 July 2017"
+output: html_notebook
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(ggplot2)
+library(ggthemes)
+library(pheatmap)
+theme_set(theme_bw())
+
+source("src/load.sWG.R")
+data <- load.sWG.data()
+#data$cns <- cbind(data$cns[,1:4,with=F],apply(data$cns[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+#data$segments <- cbind(data$segments[,1:4,with=F],apply(data$segments[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+```
+
+```{r}
+for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient==pat)]
+  x <- data$cns[,-(1:4),with=F][,i,with=F]
+  names(x) <- data$meta[i,Sample.name]
+  x <- cor(x,method = "pearson")
+  x[upper.tri(x)] <- NA
+  x <- melt(x,na.rm=T)
+  print(x[which(x$value != 1 & x$value > .8),])
+}
+```

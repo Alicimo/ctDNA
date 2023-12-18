@@ -1,0 +1,358 @@
+---
+title: "Measuring tumour dynamics via sWG sequencing of ctDNA"
+author: "Alistair Martin"
+date: "7 July 2017"
+output: html_notebook
+---
+
+```{r}
+#set up
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(ggplot2)
+library(ggthemes)
+library(GGally)
+library(MASS)
+library(nlme)
+theme_set(theme_bw())
+root.dir <- "/Users/martin06/OneDrive/projects/ctDNA/"
+
+#load data
+source(paste0(root.dir,"src/load.poseidon.R"))
+data <- poseidon.load.data(root.dir,FALSE)
+RECIST <- poseidon.load.RECIST(root.dir,FALSE)
+
+source(paste0(root.dir,"src/load.transneo.R"))
+transneo <- transneo.load.data(root.dir)
+
+#threshold points below -3 as these heavuly influence the genome wide measures if unchanged
+data$cns <- cbind(data$cns[,1:4,with=F],apply(data$cns[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+data$segments <- cbind(data$segments[,1:4,with=F],apply(data$segments[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+transneo$cns <- apply(transneo$cns,2,function(x){x[x < -3] <- -3; x})
+transneo$seg <- apply(transneo$seg,2,function(x){x[x < -3] <- -3; x})
+
+get.measures <- function(){
+  i <- data$meta[,which(type=="BC")]
+  s.OR <- apply(data$cns[,i+4,with=F],1,function(x){sd(x,na.rm=T)})
+  u.OR  <- rowSums(data$cns[,i+4,with=F]) / length(i)
+  s <- apply(2^data$cns[,i+4,with=F],1,function(x){sd(x,na.rm=T)})
+  u  <- rowSums(2^data$cns[,i+4,with=F]) / length(i)
+
+  x <- as.data.table(cbind(
+    data$meta[,.(Sample.name,type,patient,cycle,total.days)],
+    data$segments[,.(
+      n.seg=sapply(.SD[,-(1:4)],function(x){sum(by(x,chromosome,function(y){sum(na.omit(diff(y))!=0)}))}),
+      area.seg=sapply(.SD[,-(1:4)],function(x){sum(abs(x),na.rm=T)})
+      )],
+    data$cns[,.(
+      noise=sapply(.SD[,-(1:4)],function(x){median(abs(diff(x)),na.rm=T)}),
+      z=sapply(.SD[,-(1:4)],function(x){sum(((as.numeric(2^x)-u)/s)^2,na.rm=T)}),
+      z.OR=sapply(.SD[,-(1:4)],function(x){sum(abs((as.numeric(x)-u.OR)/s.OR),na.rm=T)})
+      )]
+  ))
+  x
+}
+
+get.merged.measures <- function(){
+  x <- get.measures()
+  x <- merge(x[type=="plasma" & !is.na(cycle)],RECIST,by=c("patient","cycle"),all=T)
+  x[,outcome:=rep(if(length(na.omit(unique(outcome)))>0){na.omit(unique(outcome))}else{as.character(NA)},.N),patient]
+  x <- x[!is.na(outcome)]
+  x[is.na(Sample.name),total.days:=(cycle-1)*28]
+  x[,type:=NULL]
+  x
+}
+
+averaged.interpolated.measures <- function(){
+  x <- get.merged.measures()
+  x[,total.days:=NULL]
+  x <- melt(x,id.vars = c("Sample.name","patient","cycle","outcome"))
+  x <- x[,.(value=mean(value)),.(patient,cycle,outcome,variable)]
+  x <- x[patient!=6,.(cycle=seq(min(cycle),max(cycle)),value=approx(cycle,value,seq(min(cycle),max(cycle)))$y),.(patient,outcome,variable)]
+  x <- dcast(x,patient+outcome+cycle~variable)
+  x
+}
+
+averaged.interpolated.shifted.measures <- function(){
+  x <- averaged.interpolated.measures()
+  x <- melt(x,id.vars = c("patient","cycle","outcome"))
+  x <- x[,.(cycle,value-value[1]),.(patient,outcome,variable)]
+  x <- dcast(x,patient+outcome+cycle~variable)
+  x
+}
+
+get.stephen.data <- function(){
+  y <- as.data.table(cbind(
+    transneo$col.meta[,.(RCB_category,Sample.name,patient,cycle)],
+    transneo$seg[,.(
+      n.seg=sapply(.SD,function(x){sum(by(x,transneo$row.meta[,chromosome],function(y){sum(diff(y)!=0)}))}),
+      area.seg=sapply(.SD,function(x){sum(abs(x))})
+    )],
+    transneo$cns[,.(
+      noise=sapply(.SD,function(x){median(abs(diff(x)))})
+      )]
+  ))
+  y
+}
+```
+
+```{r}
+x <- get.merged.measures()
+x <- melt(x,id.vars = c("Sample.name","patient","outcome","cycle","total.days"))
+ggplot(x) + aes(x=cycle,y=value,colour=outcome) + geom_point() + stat_summary(fun.y = mean, geom="line") + facet_grid(variable~patient,scales = "free",space = "free_x")
+```
+
+```{r}
+x <- averaged.interpolated.measures()
+ggplot(x[,.(cycle=unique(cycle)),.(patient,outcome)]) + aes(x=cycle,fill=outcome) + geom_bar()
+```
+
+```{r}
+x <- averaged.interpolated.measures()
+x <- melt(x,id.vars = c("patient","cycle","outcome"))
+
+ggplot(x[cycle<5]) + aes(y=factor(patient),x=value,colour=factor(cycle)) + geom_point(size=2) + facet_grid(outcome~variable,scales="free",space="free_y")
+```
+
+```{r}
+x <- averaged.interpolated.shifted.measures()
+x <- melt(x,id.vars = c("patient","cycle","outcome"))
+
+ggplot(x[cycle!=1 & cycle<5]) + aes(y=factor(patient),x=value,colour=factor(cycle)) + geom_point(size=2) + facet_grid(outcome~variable,scales="free",space="free_y")
+```
+
+
+```{r}
+x <-  averaged.interpolated.shifted.measures()
+ggpairs(x[,.(outcome,n.seg,area.seg,noise,z,z.OR,RECIST)],aes(colour=outcome))
+```
+
+#What happens if we calculate the correlations for each individual seperatly?
+
+```{r}
+x <-  averaged.interpolated.shifted.measures()
+x <- x[,lapply(.SD[,-7],function(x){cor(x,RECIST,use = "na.or.complete")}),.(patient,outcome)]
+x <- melt(y[!is.na(cycle) & N>5,],id.vars = c("patient","outcome","N"))
+x[order(abs(value),decreasing = T),head(.SD,1),patient]
+ggplot(x) + aes(x=variable,y=value,colour=variable) + geom_boxplot()
+```
+
+
+#Let's reduce this to a non-repeated measurements dataset
+
+```{r}
+x <- averaged.interpolated.measures()
+x <- melt(x[cycle<3],id.vars = c("patient","cycle","outcome"))
+x <- x[!is.na(value)]
+ggplot(x) + aes(x=cycle,y=value,color=outcome,group=patient) + geom_line() + geom_point() + facet_wrap(~variable,scales = "free")
+```
+
+```{r}
+x <- averaged.interpolated.shifted.measures()
+x <- melt(x[cycle<3],id.vars = c("patient","cycle","outcome"))
+x <- x[!is.na(value)]
+ggplot(x) + aes(x=cycle,y=value,color=outcome,group=patient) + geom_line() + geom_point() + facet_wrap(~variable,scales = "free")
+#ggplot(x[variable %in% c("z.OR","RECIST")]) + aes(x=cycle,y=value,color=outcome,group=patient) + geom_line(size=1.5) + geom_point(size=2) + facet_wrap(~variable,scales = "free") + theme_tufte(20) + xlab("Cycle") + ylab("Measure") + scale_x_continuous(breaks=c(1,2))
+```
+```{r}
+x <- averaged.interpolated.shifted.measures()
+x <- melt(x[cycle==2],id.vars = c("patient","cycle","outcome"))
+x <- x[!is.na(value)]
+ggplot(x) + aes(x=outcome,y=value,fill=outcome) + geom_boxplot() + facet_wrap(~variable,scales="free") 
+```
+
+```{r}
+x <- averaged.interpolated.shifted.measures()
+ggpairs(x[cycle==2,.(outcome,n.seg,area.seg,noise,z,z.OR,RECIST)],aes(colour=outcome))
+```
+
+Linear model: predict change in RECIST between cycle 1 and cycle 2 using z.OR, which correlates best out of all the measures tested/generated.
+
+```{r}
+x <- averaged.interpolated.shifted.measures()
+x <- melt(x[cycle==2],id.vars = c("patient","cycle","outcome","RECIST"))
+x[,AIC(lm(RECIST~value)),variable][order(V1)]
+summary(lm(RECIST~value,data=x[variable=="z.OR"]))
+```
+
+Build model to predcit outcome (prog vs stable vs resp) using intercept, the change in measure between cycle 1 and 2 as sole predictor, or both.
+
+```{r}
+x <- averaged.interpolated.measures()
+x <- melt(x[cycle==1],id.vars = c("patient","cycle","outcome"))
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+x[variable!="RECIST",AIC(polr(outcome~value)),variable][order(V1)]
+
+x <- averaged.interpolated.shifted.measures()
+x <- melt(x[cycle==2],id.vars = c("patient","cycle","outcome"))
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+x[,AIC(polr(outcome~value)),variable][order(V1)]
+
+x <- averaged.interpolated.measures()
+x <- melt(x[cycle==1],id.vars = c("patient","cycle","outcome"))
+y <- averaged.interpolated.shifted.measures()
+y <- melt(y[cycle==2],id.vars = c("patient","cycle","outcome"))
+x <- merge(x,y,by = c("patient","outcome","variable"))
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+x[,AIC(polr(outcome~value.x + value.y)),variable][order(V1)]
+```
+
+The change between cycle 1 & 2 of z.OR is the most informative, and adding the cycle 1 absolute value (intercept) appears to add little additional information about the eventual outcome.
+
+Given this, how predictive is a model based on delta z.OR?
+
+```{r}
+x <- averaged.interpolated.shifted.measures()
+x <- x[cycle==2]
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+m <- x[,polr(outcome~z.OR,Hess = T)]
+c <- coef(summary(m))
+c <- cbind(c, "p value" =pnorm(abs(c[, "t value"]), lower.tail = FALSE) * 2)
+c
+
+test.data <- data.table(z.OR=x[,seq(from=min(z.OR),to=max(z.OR),length.out = 1000)])
+test.data <- cbind(test.data,predict(m,newdata=test.data,type="probs"))
+test.data <- melt(test.data,id.vars = c("z.OR"))
+test.data$variable <- factor(test.data$variable,levels = levels(test.data$variable)[c(1,3,2)])
+ggplot(test.data) + aes(x=z.OR,y=value,colour=variable) + geom_line() +ylab("Prob")
+#ggplot(test.data) + aes(x=z.OR,y=value,colour=variable) + geom_line(size=1.5) +ylab("Prob.") + theme_tufte(20) + labs(color='outcome')
+
+ct <- table(x[,.(outcome,predict(m,z.OR))])
+ct
+
+#accuracy
+print("Accuracy")
+sum(diag(ct)/sum(ct))
+
+#recall
+print("Recall")
+for(i in 1:nrow(ct)){
+  print(ct[i,i]/sum(ct[i,]))
+}
+
+#precision
+print("Precision")
+for(i in 1:nrow(ct)){
+  print(ct[i,i]/sum(ct[,i]))
+}
+```
+
+
+```{r}
+y <- x[,.(patient,outcome,predict(m,z.OR))][order(outcome,patient)]
+
+z <- matrix(0,nrow=nrow(y),ncol=3)
+rownames(z) <- paste("Patient:",y$patient)
+z[y[,which(V3=="progressive")],1] <- 1
+z[y[,which(V3=="stable")],2] <- 2
+z[y[,which(V3=="response")],3] <- 3
+
+ann <- y[,2]
+rownames(ann) <- paste("Patient:",y$patient)
+
+ann_col <- hue_pal()(3)[c(1,3,2)]
+names(ann_col) <- levels(ann$outcome)
+ann_col <- list(outcome=ann_col)
+
+pheatmap(z,
+         cluster_rows = F,cluster_cols = F,
+         cellwidth = 10, cellheight = 10,
+         labels_col = c("progressive","stable","response"),
+         annotation_row = ann,
+         annotation_colors=ann_col,
+         gaps_row = c(10,13),
+         color=c("grey90",hue_pal()(3)[c(1,3,2)]),
+         breaks=seq(-.5,3.5,1),
+         legend=F
+         )
+```
+
+The accuracy looks to be affected by the presence of the "stable" group. What is the accuracy if we do not consider the predictions of these points.
+
+```{r}
+sum(diag(ct[-2,-2])/sum(ct[-2,-2]))
+```
+
+
+#Longitudial Models
+
+```{r}
+x <- averaged.interpolated.shifted.measures()
+x <- x[cycle!=1]
+x <- melt(x,id.vars = c("patient","outcome","cycle"))
+ggplot(x[cycle<6]) + aes(x=cycle,y=value,group=outcome,colour=outcome) + geom_point() + stat_summary(fun.y = mean,geom = "line") + facet_wrap(~variable,scales = "free")
+```
+
+Can we better predict the tumor dynamics using longitdual models that include a random effect?
+
+```{r}
+x <- averaged.interpolated.measures()
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+x$cycle <- factor(x$cycle)
+
+print("Random effect only")
+AIC(lme(RECIST~1,random= ~1|patient, data=x, na.action=na.omit))
+
+print("Random effect + measure")
+AIC(lme(RECIST~cycle,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~area.seg,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~n.seg,random= ~1|patient, data=x, na.action=na.omit)) 
+AIC(lme(RECIST~noise,random= ~1|patient, data=x, na.action=na.omit)) 
+AIC(lme(RECIST~z,random= ~1|patient, data=x, na.action=na.omit)) 
+AIC(lme(RECIST~z.OR,random= ~1|patient, data=x, na.action=na.omit))
+
+print("Random effect + measure + cycle")
+AIC(lme(RECIST~cycle + area.seg,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~cycle + n.seg,random= ~1|patient, data=x, na.action=na.omit)) 
+AIC(lme(RECIST~cycle + noise,random= ~1|patient, data=x, na.action=na.omit)) 
+AIC(lme(RECIST~cycle + z,random= ~1|patient, data=x, na.action=na.omit)) 
+AIC(lme(RECIST~cycle + z.OR,random= ~1|patient, data=x, na.action=na.omit))
+
+```
+```{r}
+x <- averaged.interpolated.measures()
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+AIC(lme(RECIST~1,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~cycle,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~area.seg,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~n.seg,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~area.seg + cycle,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~n.seg + cycle,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~area.seg * cycle,random= ~1|patient, data=x, na.action=na.omit))
+AIC(lme(RECIST~n.seg * cycle,random= ~1|patient, data=x, na.action=na.omit))
+```
+
+```{r,include=F,eval=F}
+x <- averaged.interpolated.measures()
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+summary(glmer(outcome ~ area.seg + cycle +  (1 | patient), family = binomial("logit"), data = x[outcome!="stable"]))
+```
+
+
+
+####################################
+# Stephen's data
+
+```{r,eval=FALSE}
+y <- get.stephen.data()
+y <- y[,.(RCB_category,cycle,area.seg=area.seg-area.seg[1],n.seg=n.seg-n.seg[1],noise=noise-noise[1]),patient]
+y <- y[cycle<3]
+y$RCB_category <- factor(y$RCB_category,levels = c("pCR","RCB-I","RCB-II","RCB-III"))
+ggplot(melt(y,id.vars=1:3)) + aes(x=cycle,y=value,group=patient,colour=RCB_category) + geom_line() + facet_wrap(~variable,scales="free")
+```
+
+
+```{r,eval=FALSE}
+x <- averaged.interpolated.measures()
+x <- x[,.(cycle,RECIST,area.seg=area.seg-area.seg[1]),.(patient,outcome)]
+x <- x[cycle==2]
+x$outcome <- factor(x$outcome,levels = c("progressive","stable","response"))
+m <- x[,polr(outcome~area.seg,Hess = T)] 
+ 
+y <- get.stephen.data()
+y <- y[,.(RCB_category,cycle,area.seg=area.seg-area.seg[1]),.(patient)]
+y <- y[cycle==2]
+
+y$outcome <- predict(m,newdata = y)
+table(y[,.(outcome,RCB_category)])
+```
+ 

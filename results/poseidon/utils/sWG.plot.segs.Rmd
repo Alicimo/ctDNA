@@ -1,0 +1,148 @@
+---
+title: "Measuring tumour dynamics via sWG sequencing of ctDNA - plot patient segementation"
+author: "Alistair Martin"
+date: "7 July 2017"
+output: html_notebook
+---
+  
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(ggplot2)
+library(ggthemes)
+library(ggbio)
+library(GenomicRanges)
+
+theme_set(theme_bw())
+
+root.dir <- "~/OneDrive/projects/ctDNA/"
+
+theme_sWG <- theme_tufte(20) + theme(
+  axis.ticks.x=element_blank(),
+  axis.text.x=element_blank(),
+  axis.ticks.y=element_blank(),
+  axis.text.y=element_blank(),
+  panel.spacing.x=unit(0, "lines"),
+  panel.border=element_rect(color="grey80",fill=NA,size=1,linetype="solid"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  strip.text.y = element_text(size=6),
+  plot.title = element_text(hjust = 0.5)
+)
+
+source(paste0(root.dir,"src/load.poseidon.R"))
+data <- poseidon.load.data(root.dir,FALSE)
+
+data$segments <- cbind(data$segments[,1:4,with=F],apply(data$segments[,-(1:4)],2,function(x){x[x < -2] <- -2; x}))
+
+#reformat segments
+segs <- lapply(1:nrow(data$meta),function(i){
+  x <- data$segments[,c(2:4,i+4),with=F]
+  names(x)[4] <- c("segment.value")
+  x$grp <- x[,c(1,which(diff(segment.value)!=0)+1,.N+1),chromosome][,rep(1:length(diff(V1)), diff(V1)),chromosome][,V1]
+  x <- x[,.(start=min(start),end=max(end),segment.value=unique(segment.value),N.bins=.N),.(chromosome,grp)][,-c('grp')]
+  x$Sample.name <- data$meta[i,Sample.name]
+  x
+})
+```
+
+```{r}
+seg.threshold <- 0.2
+for(pat in 15:15){
+#for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient == pat & type=="plasma" & !is.na(cycle))]
+  i <- i[ data$meta[i,order(total.days)] ]
+  
+  j <- data$meta[,which(patient == pat & type=="FFPE" & prior.post=="primary")]
+  i <- c(j,i)
+  
+  x <- rbindlist(segs[i])
+  x[,status:=ifelse(segment.value>seg.threshold,"gain",ifelse(segment.value< -seg.threshold,"loss","no.change"))]
+  x[,Chromosome:=factor(chromosome,levels=c(as.character(1:22),"X","Y"))]
+  x[,Sample.name:=factor(Sample.name,levels=unique(Sample.name))]
+  levels(x$Sample.name) <- c("Primary","Cycle 1","Cycle 4","Cycle 5","Cycle 6","Cycle 7","Cycle 8")
+  
+  p <- ggplot(x) + 
+    aes(xmin=start,xmax=end,ymin=0,ymax=1,fill=status) + 
+    geom_rect() +
+    facet_grid(Sample.name~Chromosome,scales = "free_x",space="free_x") +
+    theme_sWG + 
+    xlab("Chromosome") + 
+    ylab("CNA") +
+    ggtitle(paste("Patient:",pat)) + 
+    scale_fill_manual(values=c("palevioletred","lightskyblue","white"),breaks=c("gain","loss","no.change"),drop=F) +
+    theme(strip.text.x = element_text(size = 10, angle = -90),strip.text.y = element_text(size=15))
+  print(p)
+}
+```
+
+```{r}
+for(pat in 15:15){
+#for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient == pat & type=="plasma" & !is.na(cycle))]
+  i <- i[ data$meta[i,order(total.days)] ]
+  
+  j <- data$meta[,which(patient == pat & type=="FFPE" & prior.post=="primary")]
+  i <- c(j,i)
+  
+  x <- rbindlist(segs[i])
+  x[,Chromosome:=factor(chromosome,levels=c(as.character(1:22),"X","Y"))]
+  x[,Sample.name:=factor(Sample.name,levels=unique(Sample.name))]
+  levels(x$Sample.name) <- c("Primary","Cycle 1","Cycle 4","Cycle 5","Cycle 6","Cycle 7","Cycle 8")
+  
+  p <- ggplot(x) + 
+    aes(xmin=start,xmax=end,ymin=0,ymax=1,fill=segment.value) + 
+    geom_rect() +
+    facet_grid(Sample.name~Chromosome,scales = "free_x",space="free_x") +
+    theme_sWG + 
+    xlab("Chromosome") + 
+    ylab("CNA") +
+    ggtitle(paste("Patient:",pat)) + 
+    theme(strip.text.x = element_text(size = 10, angle = -90),strip.text.y = element_text(size=15)) +
+    scale_fill_gradientn(colours=c("skyblue","lightskyblue","white","white","white","palevioletred","violetred"),values=c(0,.4,.4,.5,.6,.6,1))
+  print(p)
+}
+```
+
+
+
+
+```{r}
+chromo <- makeGRangesFromDataFrame(segs[[1]][,.(start=min(start),end=max(end)),chromosome])
+seqlengths(chromo) <- segs[[1]][,max(end),chromosome][,V1]
+chromo.weights <- 0.85*seqlengths(chromo)/ sum(as.numeric(seqlengths(chromo)))
+
+ann.1 <- GRanges(" ",IRanges(1, 1))
+seqlengths(ann.1) <- 1
+
+chromo <- append(chromo,ann.1)
+chromo.weights <- c(chromo.weights," "=0.15)
+
+cna.threshold <- .2
+
+#sample.labels <- rev(c("Primary","Cycle 1","Cycle 4","Cycle 5","Cycle 6","Cycle 7","Cycle 8"))
+#for(pat in 15:15){
+  
+for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient == pat & type=="plasma" & !is.na(cycle))]
+  i <- i[ data$meta[i,order(total.days)] ]
+  
+  j <- data$meta[,which(patient == pat & type=="FFPE" & prior.post=="primary")]
+  i <- rev(c(j,i))
+  
+  p <- ggbio()
+  
+  for(j in i){
+    x <- makeGRangesFromDataFrame(segs[[j]],keep.extra.columns = T,seqinfo = seqinfo(chromo))
+    x <- x[abs(x$segment.value) > cna.threshold]
+    x$status <- ifelse(x$segment.value>cna.threshold,"gain","loss")
+    #p <- p + circle(x,geom="rect",aes(fill=status),colour="white",chr.weight=chromo.weights) + annotate(geom="text",label=sample.labels[which(i==j)],x =-12,y=(33+7*which(i==j)))
+    p <- p + circle(x,geom="rect",aes(fill=status),colour="white",chr.weight=chromo.weights) + annotate(geom="text",label=data$meta[j,Sample.name],x =-12,y=(33+7*which(i==j)))
+  }
+  
+  p <- p + circle(chromo[-c(24)], geom = "rect", fill = "gray70",chr.weight=chromo.weights) + 
+    circle(chromo, geom = "scale", size = 2,chr.weight=chromo.weights) + 
+    circle(chromo, geom = "text", aes(label = seqnames), vjust = -1, size = 6,chr.weight=chromo.weights)
+  print(p)
+}
+```

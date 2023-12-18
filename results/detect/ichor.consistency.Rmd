@@ -1,0 +1,1645 @@
+---
+title: 'DETECT: ichorCNA on sWG'
+author: "Alistair Martin"
+date: '`r format(Sys.time(), "Last modified: %d %b %Y")`'
+---
+
+# Load/generate data
+
+## Set up
+
+```{r 'setup', message=FALSE, warning=FALSE}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+
+knitr::opts_chunk$set(fig.path = paste0(project.dir,"results/detect/"), dev=c('png', 'pdf'))
+
+pkgs <- c("data.table","ggplot2","ggthemes","GGally","ggbio","gridExtra","ichorCNA","GenomicRanges","survival","survminer",
+          "org.Hs.eg.db","TxDb.Hsapiens.UCSC.hg19.knownGene","BSgenome.Hsapiens.UCSC.hg19","grid","pheatmap","ape","zoo")
+pkgs <- lapply(pkgs,function(pkg) suppressWarnings(suppressMessages(require(pkg, ch = TRUE))))
+                                  
+source(paste0(project.dir,"src/ichorCNA.wrapper.R"))
+source(paste0(project.dir,"src/ABSOLUTE.wrapper.R"))
+source(paste0(project.dir,"src/load.detect.R"))
+
+detect <- detect.load(project.dir)
+
+detect$sWG.normed <- normalise.ichorCNA(detect$sWG,which(detect$sWG.meta[,Sample.type=="BC"]))
+```
+
+## Run IchorCNA
+
+```{r}
+ichor.dir <- paste0(project.dir,"data/ichor/ichor.default/")
+env.vars <- get.default.env.vars.ichorCNA()
+x <- run.ichor.pipeline(detect$sWG.normed$cns,env.vars,ichor.dir,verbose = F)
+detect$ichorCNA.bestModels <- x$bestModels
+detect$ichorCNA.summary <- x$summary
+rm(x)
+```
+
+# Consistency of CNA calls
+
+## Functions
+
+```{r}
+expand.segmentation <- function(detect){
+  segs.expanded <- lapply(detect$ichorCNA.bestModels, function(x){
+    segs <- data.table(x$results$segs[[1]])
+    segs[,.(seq(start-1,end-1e6,1E6),copy.number),.(chr,start,end)][,.(chr,start=V1,copy.number)]
+  })
+  
+  for(i in detect$ichorCNA.summary[,which(n_est==1)]){
+    segs.expanded[[i]][,copy.number:=2]
+  }
+  
+  segs.expanded <- cbind(
+    segs.expanded[[1]][,copy.number],
+    sapply(segs.expanded[-1], function(x){
+      merge(segs.expanded[[1]],x,by=c("chr","start"),all.x=TRUE)[,copy.number.y]
+    })
+  )
+  colnames(segs.expanded) <- names(detect$ichorCNA.bestModels)
+  segs.expanded
+}
+
+get.dist.mat <- function(segs.expanded,dist.func,...){
+  N <- ncol(segs.expanded)
+  dist.matrix <- matrix(0,N,N)
+  colnames(dist.matrix) <- colnames(segs.expanded)
+  rownames(dist.matrix) <- colnames(segs.expanded)
+  for(i in 1:N){
+    for(j in i:N){
+      x <- dist.func(segs.expanded[,i],segs.expanded[,j],...)
+      dist.matrix[i,j] <- x
+      dist.matrix[j,i] <- x
+    }
+  }
+  return(dist.matrix)
+}
+
+cor.dist <- function(x,y,...){
+  if(var(x,na.rm=T)==0 | var(y,na.rm=T)==0) return(NA)
+  else return(cor(x,y,...))
+}
+
+custom.dist <- function(x,y,...){
+    x <- sum(x != y,na.rm = T)
+    x <- x - 0.5*sum( (x>2 & y>2) & (x != y) ,na.rm = T)
+    x <- x / sum( !is.na(x) & !is.na(y) )
+}
+```
+
+```{r}
+table(detect$ichorCNA.summary$n_est==1,sapply(detect$ichorCNA.bestModels,function(x) length(na.omit(unique(x$results$segs[[1]]$copy.number)))))
+```
+
+
+```{r}
+segs.expanded <- expand.segmentation(detect)
+dist.matrix <-get.dist.mat(segs.expanded,cor.dist,use="pairwise.complete.obs")
+#dist.matrix <- get.dist.mat(segs.expanded,custom.dist)
+```
+
+### Same patient vs diff patient
+
+```{R}
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+x <- dist.matrix[i,i]
+x[lower.tri(x)] <- NA
+x <- data.table(melt(x))
+x <- x[!is.na(value)]
+x <- x[Var1 != Var2]
+
+x$p.ID.1 <- detect$sWG.meta[match(x$Var1,detect$sWG.meta$Sample.name),Patient.ID]
+x$p.ID.2 <- detect$sWG.meta[match(x$Var2,detect$sWG.meta$Sample.name),Patient.ID]
+
+ks.test(x[p.ID.1==p.ID.2,value],x[p.ID.1!=p.ID.2,value],alternative = "g")
+
+(p <- ggplot(x) + aes(x=p.ID.1==p.ID.2,y=value,fill=p.ID.1==p.ID.2) + geom_boxplot(notch=T) + geom_signif(test="wilcox.test",comparisons = list(c("FALSE", "TRUE")),textsize=6) + labs(x="Samples from same patient",y="Correlation") + theme_tufte(20) + theme(legend.position = "None"))
+
+```
+
+### BC grouping
+
+```{r}
+pdf(paste0(project.dir,"results/detect/plots/ichorCNA.clustering/all.BC.pdf"))
+plot(as.phylo(hclust(as.dist(dist.matrix))),type="fan",cex=0.5,tip.color=detect$sWG.meta[,as.numeric(factor(Sample.type=="BC"))])
+dev.off()
+plot(as.phylo(hclust(as.dist(dist.matrix))),type="fan",cex=0.5,tip.color=detect$sWG.meta[,as.numeric(factor(Sample.type=="BC"))])
+```
+### ctDNA grouping
+
+```{r}
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+ann.row <- data.frame(Patient.ID=as.factor(detect$sWG.meta[i]$Patient.ID),tumour.frac=as.factor((1-detect$ichorCNA.summary$n_est[i])>.06))
+rownames(ann.row) <- detect$sWG.meta[i]$Sample.name
+pheatmap(dist.matrix[i,i],annotation_row = ann.row,annotation_col = ann.row,legend=T,show_rownames = F,show_colnames = F,annotation_names_row = T,annotation_names_col = T,cellwidth = 2,cellheight = 2,filename = "~/Desktop/detect.distance.cor.heatmap.png")
+```
+
+
+### Patient-wise grouping
+
+```{r}
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+for(p.ID in unique(detect$sWG.meta[i,Patient.ID])){
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.clustering/",p.ID,".pdf"))
+  plot(as.phylo(hclust(as.dist(dist.matrix[i,i]))),type="fan",cex=0.7,tip.color=detect$sWG.meta[i,as.numeric(factor(Patient.ID==p.ID))])
+  dev.off()
+}?
+```
+
+### IGP 
+
+Not sure if appropriate for this. --> Needs centroids --> Could use primary tumours? --> Nope, Rand indices more appropiate.
+
+https://academic.oup.com/biostatistics/article/8/1/9/251048#2979265
+
+```{r, eval=F}
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+dist.matrix.sub <- dist.matrix[i,i]
+diag(dist.matrix.sub) <- NA
+nns <- apply(dist.matrix.sub,1,which.min)
+
+assigned.groups <- detect$ichorCNA.summary[i][,Patient.ID]
+x <- sapply(unique(assigned.groups),function(group){
+  i <- which(assigned.groups==group)
+  if (length(i) == 1) return(NA)
+  else return(sum(nns[i] %in% i) / length(i))
+})
+x <- data.table(patient.ID=unique(assigned.groups),N=detect$ichorCNA.summary[i][,.N,Patient.ID][,N],IGP=x)
+x[,.(.N,median(IGP)),.(N_g=N)][order(N_g)]
+```
+
+### (adj) Rand index w.r.t hierachal clustering
+
+```{r}
+x <- cbind(detect$sWG.meta,detect$ichorCNA.summary)
+pat.subset <-x[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>4,Patient.ID]
+i <- x[,.I[Sample.type=="ctDNA" & n_est!=1 & Patient.ID %in% pat.subset]]
+dist.matrix.sub <- dist.matrix[i,i]
+meta.sub <- x[i]
+
+j <- as.numeric(factor(meta.sub[,Patient.ID]))
+h <- hclust(as.dist(1-dist.matrix.sub))
+k <- cutree(h,nrow(meta.sub[,.N,Patient.ID]))
+
+if(0){
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.clustering/",p.ID,".pdf"))
+  plot(as.phylo(h,type="fan",cex=0.7))
+  dev.off()
+}
+  
+length(pat.subset)
+length(j)
+fossil::rand.index(j,k)
+fossil::adj.rand.index(j,k)
+```
+
+### (adj) Rand index w.r.t simlarity to primary tumours
+
+```{r}
+x <- cbind(detect$sWG.meta,detect$ichorCNA.summary)
+pat.subset <- intersect(
+  x[Sample.type == "PT" & n_est!=1,Patient.ID],
+  x[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>9,Patient.ID]
+)
+
+i <- x[,.I[Sample.type=="ctDNA" & n_est!=1 & Patient.ID %in% pat.subset]]
+
+j <- x[,.I[Sample.type == "PT" & Patient.ID %in% pat.subset]]
+j <- j[ x[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+
+group_ref <- as.numeric(factor(x[i,Patient.ID]))
+group_pred <- as.numeric(factor(sapply(i, function(k) {
+  x[j[which.min(dist.matrix[k,j])],Patient.ID] 
+})))
+
+fossil::rand.index(group_ref,group_pred)
+fossil::adj.rand.index(group_ref,group_pred)
+
+#group_euclid <- cutree(hclust(as.dist(dist.matrix[i,i])),length(pat.subset))
+#rand.index(group_ref,group_euclid)
+#adj.rand.index(group_ref,group_euclid)
+```
+
+### (adj) Rand index w.r.t simlarity to met tumours
+
+```{r}
+pat.subset <- intersect(
+  detect$ichorCNA.summary[Sample.type=="MT" & n_est!=1,Patient.ID],
+  detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>2,Patient.ID]
+)
+i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID %in% pat.subset])
+j <- which(detect$ichorCNA.summary[,Sample.type == "MT" & Patient.ID %in% pat.subset])
+j <- j[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+
+group_ref <- as.numeric(factor(detect$ichorCNA.summary[i,Patient.ID]))
+group_pred <- as.numeric(factor(sapply(i, function(x) detect$ichorCNA.summary[j[which.min(dist.matrix[x,j])],Patient.ID] )))
+group_euclid <- cutree(hclust(as.dist(dist.matrix[i,i])),length(pat.subset))
+
+rand.index(group_ref,group_pred)
+adj.rand.index(group_ref,group_pred)
+
+rand.index(group_ref,group_euclid)
+adj.rand.index(group_ref,group_euclid)
+```
+
+### Distance: 1st vs Nth
+
+```{r}
+pat.subset <- detect$sWG.meta[Sample.type == "ctDNA" & detect$ichorCNA.summary$n_est!=1,.N,Patient.ID][N>4,Patient.ID]
+x <- rbindlist(lapply(pat.subset,function(p.ID){
+  
+  i <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type == "ctDNA"] & detect$ichorCNA.summary$n_est!=1 )
+  x <- cbind(detect$sWG.meta[i],detect$ichorCNA.summary[i,.(n_est)])
+  x$dist.1st <- dist.matrix[i,i[which.min(x$Date.collected)]]
+  x$dist.nth <- dist.matrix[i,i[which.max(x$Date.collected)]]
+  
+  if("PT" %in% detect$sWG.meta[Patient.ID==p.ID,Sample.type]){
+    j <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type == "PT"] & detect$ichorCNA.summary$n_est!=1 )
+    j <- j[ detect$sWG.meta[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1]]
+    x$dist.PT <- dist.matrix[i,j]
+  } else {
+    x$dist.PT <- NA*length(i)
+  }
+  
+  if("MT" %in% detect$sWG.meta[Patient.ID==p.ID,Sample.type]){
+    j <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type == "MT"] & detect$ichorCNA.summary$n_est!=1 )
+    j <- j[ detect$sWG.meta[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1]]
+    x$dist.MT <- dist.matrix[i,j]
+  } else {
+    x$dist.MT <- NA*length(i)
+  }
+  
+  return(x)
+}))
+
+x[,Date.relative:=Date.collected-min(Date.collected),Patient.ID]
+x <- melt(x,id.vars = c("Patient.ID","Date.relative","n_est"), measure.vars=c("dist.1st","dist.nth","dist.PT","dist.MT"))
+x[,direct:=factor(ifelse(variable %in% c("dist.1st","dist.PT"),1,-1))]
+
+x$Patient.ID <- factor(x$Patient.ID)
+#summary(x[variable=="dist.1st" & value!=1,lm( (value-1) ~ 0 + Date.relative)])
+#summary(x[variable=="dist.nth"  & value!=1,.(value,Date.relative - max(Date.relative)),Patient.ID][,lm( (value-1) ~ 0 + V2)])
+summary(x[variable=="dist.1st",lm( (value-1) ~ 0 + Date.relative + Patient.ID:Date.relative)])
+summary(x[variable=="dist.nth",.(value,Date.relative - max(Date.relative)),Patient.ID][,lm( (value-1) ~ 0 + V2 + Patient.ID:V2)])
+# should I remove t=0?
+
+x[,direct:=factor(ifelse(variable %in% c("dist.1st","dist.PT"),1,-1),levels=c(1,-1))]
+
+(p <- ggplot(x) + aes(x=Date.relative,y=value,colour=variable,group=variable,linetype=direct,label=(1-n_est)) + geom_line() + geom_point() + facet_wrap(~Patient.ID,scale="free_x",nrow=2) + theme_bw(20) + labs(y="Correlation",x="Days") + theme(panel.grid=element_blank(),legend.position = "top") +  scale_color_manual(name="Cor. calc. w.r.t.",labels=c("1st ctDNA sample", "Last ctDNA sample","Primary biopsy","Metastatic Biopsy"),values=c("Salmon","Salmon","Sky Blue","Sky Blue")) + scale_linetype_manual(name="Cor. calc. w.r.t.",labels=c("1st ctDNA sample", "Last ctDNA sample","Primary biopsy","Metastatic Biopsy"),values=c("solid","dashed","solid","dashed")) + 
+  guides(colour = guide_legend(override.aes = list(color=c("Salmon","Salmon","Sky Blue","Sky Blue"),linetype = c(1,3,1,3)),nrow=2,byrow=TRUE)) + scale_linetype(guide = FALSE))
+
+ggsave("~/Desktop/detect.evolution.CNA.png",p,dpi=300,width=11,height = 6)
+```
+
+### Distance from PT
+
+```{r}
+pat.subset <- intersect(
+  detect$sWG.meta[Sample.type=="PT" & detect$ichorCNA.summary$n_est!=1,Patient.ID],
+  detect$sWG.meta[Sample.type == "ctDNA" & detect$ichorCNA.summary$n_est!=1,.N,Patient.ID][N>4,Patient.ID]
+)
+x <- rbindlist(lapply(pat.subset,function(p.ID){
+  i <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type == "ctDNA"] & detect$ichorCNA.summary$n_est!=1 )
+  j <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type == "PT"] & detect$ichorCNA.summary$n_est!=1 )
+  j <- j[ detect$sWG.meta[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+  x <- cbind(detect$sWG.meta[i],detect$ichorCNA.summary[i,.(n_est)])
+  x$PT.dist <- dist.matrix[i,j]
+  return(x)
+}))
+x[,Date.relative:=Date.collected-min(Date.collected),Patient.ID]
+
+#ggplot(x) + aes(x=factor(Patient.ID),y=PT.dist,label=Sample.num,fill=factor(Sample.num)) + geom_label() + ylim(0,1) + theme_bw() + theme(panel.grid.major.y = element_blank(),panel.grid.minor.y=element_blank(),legend.position = "none")
+
+ggplot(x) + aes(x=Date.relative,y=PT.dist,colour=factor(Patient.ID),group=Patient.ID) +geom_line() + geom_point()
+ggplot(x[n_est<0.94]) + aes(x=Date.relative,y=PT.dist,colour=factor(Patient.ID),group=Patient.ID) +geom_line() + geom_point()
+```
+
+
+
+
+### PT vs MT distance
+
+```{r,eval=F}
+pat.subset <- intersect(
+  detect$ichorCNA.summary[Sample.type=="MT" & n_est!=1,Patient.ID],
+  intersect(
+    detect$ichorCNA.summary[Sample.type=="PT" & n_est!=1,Patient.ID],
+    detect$ichorCNA.summary[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>0,Patient.ID]
+)) 
+lapply(pat.subset,function(p.ID){
+  i <- which(detect$ichorCNA.summary[,Sample.type == "ctDNA" & n_est!=1 & Patient.ID == p.ID])
+  j <- which(detect$ichorCNA.summary[,Sample.type == "PT" & n_est!=1 & Patient.ID == p.ID])
+  j <- j[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+  k <- which(detect$ichorCNA.summary[,Sample.type == "MT" & n_est!=1 & Patient.ID == p.ID])
+  k <- k[ detect$ichorCNA.summary[j][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+  d <- rbindlist(lapply(i, function(l) list(PT=dist.matrix[l,j],MT=dist.matrix[l,k])))
+  d$sample.name <- detect$ichorCNA.summary[i,Sample.name]
+  d
+})
+```
+
+# Gene-level copy numbers
+
+## HER2
+
+```{r}
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+her2.id <- mapIds(org.Hs.eg.db,keys=c("HER2"),column="ENTREZID",keytype = "ALIAS")
+her2.tx <- genes(Tx.Db)
+her2.tx <- her2.tx[her2.tx$gene_id == her2.id]
+seqlevels(her2.tx) <- gsub("chr","",seqlevels(her2.tx))
+her2.tx$gene_id <- "HER2"
+
+width(her2.tx) / 100 # expected reads at 0.01x with no amplification
+```
+
+
+### Primary ichorCNA calls
+
+```{r}
+her2.CN <- sapply(detect$ichorCNA.bestModels, function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  segs$copy.number[findOverlaps(her2.tx, segs,type="within",select = "first")]
+})
+
+x <- cbind(detect$sWG.meta,her2.CN)
+#x <- x[detect$ichorCNA.summary$n_est != 1]
+
+x[,.N,.(Sample.type,her2.CN>2)][,.(her2.CN,N/sum(N)),Sample.type][her2.CN==TRUE]
+
+x[,her2.CN:=factor(her2.CN,levels=5:1)]
+
+x[Sample.type %in% c("MT","PT"),Sample.type:="Biopsy"]
+x[Sample.type=="ctDNA",Sample.type:=ifelse((1-detect$ichorCNA.summary$n_est)>.06,"ctDNA (high risk)","ctDNA (low risk)")]
+x[Sample.type=="BC",Sample.type:="Buffy Coat"]
+x[,Sample.type:=factor(Sample.type,levels=c("Buffy Coat","ctDNA (low risk)","ctDNA (high risk)","Biopsy"))]
+
+(p <- ggplot(x) + aes(x=Sample.type,fill=her2.CN) + geom_bar(position="fill",colour="white") + coord_flip() + theme_tufte(20) + scale_y_continuous(labels = scales::percent_format()) + scale_fill_manual(name="",values=c("grey80","grey80","Salmon","Sky Blue","grey80")) + labs(x="",y="") + theme(legend.position = "top"))
+
+ggsave(file="~/Desktop/Detect.Her2.ichor.png",p,width=7,height = 5,dpi=300)
+```
+
+```{r}
+i <- which(detect$sWG.meta$Sample.type!="BC" & detect$ichorCNA.summary$n_est!=1)
+
+her2.CN <- sapply(detect$ichorCNA.bestModels[i], function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  segs$copy.number[findOverlaps(her2.tx, segs,type="within",select = "first")]
+})
+
+qplot(her2.CN,bins="5") + geom_bar(colour="white")
+```
+
+### Binned reads
+
+random plot for emma
+```{R,eval=F}
+x <- detect$sWG$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+x$Her2 <- 1:nrow(x)==i
+y <- merge(merge(detect$sWG.meta,detect$ichorCNA.summary),melt(x,id.vars = c(1:4,ncol(x)),variable.name = "Sample.name"))
+
+(p <- ggplot(y[Patient.ID == 190]) + aes(x=factor(start),y=value,fill=Her2) + geom_col() + facet_grid(Sample.name~.) + theme(axis.text = element_blank()))
+(p <- ggplot(y[Patient.ID == 199]) + aes(x=factor(start),y=value,fill=Her2) + geom_col() + facet_grid(Sample.name~.) + theme(axis.text = element_blank()))
+```
+
+
+```{r}
+x <- detect$sWG$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+x$Her2 <- 1:nrow(x)==i
+y <- merge(merge(detect$sWG.meta,detect$ichorCNA.summary),melt(x,id.vars = c(1:4,ncol(x)),variable.name = "Sample.name"))
+ggplot(y[Sample.type!="BC" & n_est!=1]) + aes(x=factor(start),y=value,fill=Her2) + geom_boxplot() + facet_grid(Sample.type~.)
+ggplot(y[Sample.type!="BC" & n_est!=1]) + aes(x=factor(start),y=value/(1-n_est),fill=Her2) + geom_boxplot() + facet_grid(Sample.type~.)
+```
+
+
+```{r}
+x <- detect$sWG$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+x <- cbind(x[,(1:4),with=F],apply(x[,-(1:4)],2,base::rank))
+x$Her2 <- 1:nrow(x)==i
+y <- merge(merge(detect$sWG.meta,detect$ichorCNA.summary),melt(x,id.vars = c(1:4,ncol(x)),variable.name = "Sample.name"))
+ggplot(y[Sample.type!="BC" & n_est!=1]) + aes(x=factor(start),y=value,fill=Her2) + geom_boxplot() + facet_grid(Sample.type~.)
+ggplot(y[n_est==1]) + aes(x=factor(start),y=value,fill=Her2) + geom_boxplot() + facet_grid(Sample.type~.)
+ggplot(y[Her2==T & n_est!=1]) + aes(x=value,y=(1-n_est),colour=Sample.type) + geom_point() 
+```
+
+
+```{r}
+y[Sample.type %in% c("MT","PT"),Sample.type:="Biopsy"]
+y[Sample.type=="ctDNA",Sample.type:=ifelse((1-n_est)>.06,"ctDNA (high risk)","ctDNA (low risk)")]
+
+(p <- ggplot(y[Sample.type!="BC" ]) + aes(x=factor(start),y=value,fill=Her2) + geom_boxplot() + facet_grid(Sample.type~.) + theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),legend.position = "top") + labs(x="Chr. 17 split into 1Mb bins", y="Bin rank by # of mapped reads",fill="Bin contains Her2 gene"))
+
+ggsave(file="~/Desktop/Detect.Her2.rank.png",p,width=10,height = 5,dpi=300)
+```
+
+```{r}
+x <- detect$sWG$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+```{r}
+x <- detect$sWG$cns
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+### Binned reads [100kb]
+
+```{r}
+x <- sWG.load.data(paste0(project.dir,"data/QDNA/bins"))
+i <- c(1:4,match(detect$ichorCNA.summary$Sample.name,colnames(x$cns)))
+x$cns <- x$cns[,i,with=F]
+x$segments <- x$segments[,i,with=F]
+
+x <- x$cns[chromosome==as.numeric(seqnames(her2.tx))]
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+```{r}
+x <- sWG.load.data(paste0(project.dir,"data/sWG/100kb/"))
+i <- c(1:4,match(detect$ichorCNA.summary$Sample.name,colnames(x$cns)))
+x$cns <- x$cns[,i,with=F]
+x$segments <- x$segments[,i,with=F]
+
+x <- x$cns
+bins <- makeGRangesFromDataFrame(x)
+i <- findOverlaps(her2.tx,bins,type="within",select = "first")
+
+y <- cbind(detect$sWG.meta,HER2.rank=as.numeric(apply(x[,-(1:4)],2,function(y) order(y)[i])),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.rank,fill=tumour.detected) + geom_violin(draw_quantiles = c(.5)) 
+
+y <- cbind(detect$sWG.meta,HER2.diff=as.numeric(apply(x[,-(1:4)],2,function(y) y[i]-median(y))),tumour.detected=detect$ichorCNA.summary[,n_est!=1])
+ggplot(y) + aes(x=Sample.type,y=HER2.diff,fill=tumour.detected) +  geom_violin(draw_quantiles = c(.5)) + geom_hline(yintercept = 0,linetype=2)
+```
+
+
+# CNA 
+
+## Functions
+
+```{r}
+expand.segmentation <- function(segs){
+  segs.expanded <- lapply(segs, function(x){
+    x[,.(seq(start-1,end-1e6,1E6),copy.number),.(chr,start,end)][,.(chr,start=V1,copy.number)]
+  })
+  if(length(segs.expanded) == 1) segs.expanded <- segs.expanded[[1]]
+  else {
+    segs.expanded <- cbind(
+      segs.expanded[[1]][,-3],
+      sapply(segs.expanded, function(x){
+        merge(segs.expanded[[1]],x,by=c("chr","start"),all.x=TRUE,sort=F)[,copy.number.y]
+      })
+    )
+  }
+  return(segs.expanded)
+}
+
+aggregate.segmentation <- function(segs.expanded){
+  x <- segs.expanded[,-(1:2)]
+  N <- ncol(x)
+  x <- cbind(segs.expanded[,1:2],V1=rowSums(x<2,na.rm=T),V2=rowSums(x>2,na.rm=T),V3=rowSums(is.na(x)))
+  
+  print(paste("Removed rows in aggregation:",nrow(x[V3>(N/10)]), "out of", nrow(x)))
+  
+  x[V3>(N/10),V1:=NA]
+  x[,V1:=V1/(N-V3)]
+  x[,V1:=na.locf(V1)]
+
+  x[V3>(N/10),V2:=NA]
+  x[,V2:=V2/(N-V3)]
+  x[,V2:=na.locf(V2)]
+  
+  x
+}
+
+reduce.segmentation.wrapper <- function(segs.aggregated){
+  l <- segs.aggregated[,.(chr,start,V1)]
+  g <- segs.aggregated[,.(chr,start,V1=V2)]
+  x <- list(
+    gain =  reduce.segmentation(g),
+    loss =  reduce.segmentation(l)
+  )
+  x
+}
+
+reduce.segmentation <- function(x){
+  x$grp <- x[,c(1,which(diff(V1)!=0)+1,.N+1),chr][,rep(1:length(diff(V1)), diff(V1)),chr][,V1]
+  x <- x[,.(start=min(start)+1,end=max(start)+1E6,V1=unique(V1),N.bins=.N),.(chr,grp)][,-c('grp')]
+  x$chr <- factor(x$chr,levels = c(1:22,"X"))
+  x
+}
+
+extract.segs <- function(i){
+  return(lapply(i, function(j) {
+    x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+    if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+    return(x)
+  }))
+}
+
+process.segs <- function(segs.raw){
+  segs <- list()
+  segs$raw <- segs.raw
+  segs$expanded <- expand.segmentation(segs$raw)
+  segs$aggregated <- aggregate.segmentation(segs$expanded)
+  segs$agg.reduced <- reduce.segmentation.wrapper(segs$aggregated)
+  return(segs)
+}
+
+get_segs <- function(i){
+  segs <- extract.segs(i)
+  segs<- process.segs(segs)
+  return(segs)
+}
+```
+
+
+## Individual samples (non-circus)
+
+```{r}
+theme_sWG <- theme_tufte(20) + theme(
+  axis.ticks.x=element_blank(),
+  axis.text.x=element_blank(),
+  panel.spacing.x=unit(0, "lines"),
+  panel.border=element_rect(color="grey80",fill=NA,size=1,linetype="solid"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  axis.title.x = element_blank(),
+  legend.title = element_blank(),
+  legend.position="bottom"
+)
+
+fct_labels <- c(1:22,"X")
+names(fct_labels) <-  c(1:22,"X")
+fct_labels[seq(10,23,2)] <- ""
+fct_labels[21] <- ""
+fct_labels <- as_labeller(fct_labels)
+
+for(i in 1:nrow(detect$ichorCNA.summary)){
+  
+    p <- ggplot() + aes(x=start,y=log2) + facet_grid(~chr,scales = "free_x",space="free_x",labeller = fct_labels) + ylim(-3,5) +
+      scale_linetype_manual(values=c("FALSE"="solid","TRUE"="dotted")) + theme_sWG +
+      scale_colour_manual(values=c("1"="steelblue","2"="green","3"="orange","4"="orangered","5"="red"),name="Copy\nNumber")
+    
+    y <- detect$sWG$cns[,c(2:4,i+4),with=F]
+    names(y) <- c("chr","start","end","log2")
+    y$chr <- factor(y$chr,levels=c(1:22,"X"))
+    p <- p + geom_point(data=y,size=0.05)
+    
+    x <- data.table(detect$ichorCNA.bestModels[[i]]$results$segs[[1]])
+    if(detect$ichorCNA.summary[i,n_est]==1) x[,copy.number:=2]
+    x <- x[,.(chr,start,end,log2=median,copy.number,subclone.status)]
+    x$chr <- factor(x$chr,levels=c(1:22,"X"))
+    x$copy.number <- factor(x$copy.number,levels=1:5)
+    p <- p + geom_segment(aes(xend=end,yend=log2,color=copy.number,linetype=subclone.status),data = x,size=1.2)
+    
+    p <- p + ggtitle(detect$ichorCNA.summary[i,paste0(Sample.name,": ",(1-n_est)*100,"%")])
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.indv/",detect$ichorCNA.summary[i,Sample.name],".pdf"),plot=p,width = 10, height = 5)
+}
+```
+
+## Patient-wise (circus)
+
+### All samples
+
+```{r}
+for(p.ID in unique(detect$sWG.meta[,.N,Patient.ID][order(-N),Patient.ID])){
+  i <- detect$sWG.meta[,which(Patient.ID == p.ID & Sample.type!="BC")]
+  if(length(i)!=0){
+    i <- i[detect$sWG.meta[i][,order(Sample.type,Sample.num)]]
+    segs <- lapply(i, function(j) {
+      x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    n_est <- detect$ichorCNA.summary[i]$n_est
+    names(segs) <- detect$sWG.meta[i,paste0(Patient.ID,":",ifelse(!is.na(Sample.num),Sample.num,Sample.type)," (",signif(1-n_est,3)*100,"%)")]
+    p <- circus.plot(segs)
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus/",p.ID,".pdf"),width = 10, height = 10)
+  }
+}
+```
+
+### Remove zero TF samples
+
+```{r}
+#for(p.ID in unique(detect$sWG.meta[,.N,Patient.ID][order(-N),Patient.ID])){
+for(p.ID in c(52,81,150,161,190,210,275)){
+  i <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type!="BC"] & detect$ichorCNA.summary$n_est != 1)
+  if(length(i)!=0){
+    i <- i[detect$sWG.meta[i][,order(Sample.type,Sample.num)]]
+    segs <- lapply(i, function(j) {
+      x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    n_est <- detect$ichorCNA.summary[i]$n_est
+    names(segs) <- detect$sWG.meta[i,paste0(Patient.ID,":",ifelse(!is.na(Sample.num),Sample.num,Sample.type)," (",signif(1-n_est,3)*100,"%)")]
+    p <- circus.plot(segs)
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus.TF_enforced/",p.ID,".pdf"),width = 10, height = 10)
+  }
+}
+```
+
+### Samples with highest TF
+
+```{r}
+for(p.ID in unique(detect$sWG.meta[,.N,Patient.ID][order(-N),Patient.ID])){
+  
+  i <- cbind(detect$sWG.meta,detect$ichorCNA.summary)[,.I[Patient.ID == p.ID & Sample.type!="BC" & n_est != 1]]
+  i <- i[cbind(detect$sWG.meta,detect$ichorCNA.summary)[i][,.I[which.min(n_est)],Sample.type][,V1]]
+  
+  if(length(i)>1 & "ctDNA" %in% detect$sWG.meta[i,Sample.type]){
+    i <- i[detect$sWG.meta[i][,order(Sample.type,Sample.num)]]
+    segs <- lapply(i, function(j) {
+      x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    n_est <- detect$ichorCNA.summary[i]$n_est
+    names(segs) <- detect$sWG.meta[i,paste0(Patient.ID,":",ifelse(!is.na(Sample.num),Sample.num,Sample.type)," (",signif(1-n_est,3)*100,"%)")]
+    p <- circus.plot(segs)
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus.TF_high/",p.ID,".pdf"),width = 10, height = 10)
+  }
+}
+```
+
+### Difference *groan*
+
+```{r}
+for(p.ID in unique(detect$sWG.meta[,.N,Patient.ID][order(-N),Patient.ID])){
+  
+  i <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type=="ctDNA"] & detect$ichorCNA.summary$n_est != 1)
+  
+  j <- cbind(detect$sWG.meta,detect$ichorCNA.summary)[,.I[Patient.ID == p.ID & Sample.type %in% c("MT","PT") & n_est != 1]]
+  j <- j[cbind(detect$sWG.meta,detect$ichorCNA.summary)[j][,.I[which.min(n_est)]]]
+         
+  if(length(i)>0 & length(j)>0){
+    i <- i[detect$sWG.meta[i][,order(Sample.num)]]
+    segs <- lapply(i, function(k) {
+      x <- data.table(detect$ichorCNA.bestModels[[k]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[k,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    segs <- expand.segmentation(segs)
+    biopsy <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+    biopsy.expanded <- expand.segmentation(list(biopsy))
+    
+    segs <- merge(biopsy.expanded,segs,sort=F,by=c("chr","start"))
+    segs <- cbind(segs[,1:2],segs[,4:ncol(segs)]-unlist(segs[,3]))
+    
+    segs <- lapply(seq_along(i), function(k){
+      x <- segs[,c(1:2,k+2),with=F]
+      names(x)[3] <- "V1"
+      x <- reduce.segmentation(x)[,1:4]
+      names(x)[4] <- "copy.number"
+      x <- x[!is.na(copy.number)]
+      x[,copy.number:=ifelse(copy.number>0,3,ifelse(copy.number==0,2,1))]
+      x[,subclone.status:=FALSE]
+      return(x)
+    })
+    
+    #segs[[length(segs)+1]] <- biopsy
+    #i <- c(i,j)
+    
+    n_est <- detect$ichorCNA.summary[i]$n_est
+    names(segs) <- detect$sWG.meta[i,paste0(Patient.ID,":",ifelse(!is.na(Sample.num),Sample.num,Sample.type)," (",signif(1-n_est,3)*100,"%)")]
+    p <- circus.plot(segs)
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus.diff/",p.ID,".pdf"),width = 10, height = 10)
+  }
+}
+```
+
+
+## Patient-combined (circus)
+
+```{r}
+chromo <- seqlengths(Hsapiens)[1:23]
+chromo <- data.table(chr=factor(substr(names(chromo),4,6),levels = c(1:22,"X")),start=1,end=as.numeric(chromo),V1=0)
+
+for(p.ID in unique(detect$sWG.meta[,.N,Patient.ID][order(-N),Patient.ID])){
+  
+  i <- which(detect$sWG.meta[,Patient.ID == p.ID & Sample.type=="ctDNA"] & detect$ichorCNA.summary$n_est != 1)
+  if(length(i)!=0){
+    segs <- lapply(i, function(j) {
+      x <- data.table(detect$ichorCNA.bestModels[[j]]$results$segs[[1]])
+      if(detect$ichorCNA.summary[j,n_est]==1) x[,copy.number:=2]
+      return(x)
+    })
+    segs.expanded <- expand.segmentation(segs)
+    segs.aggregated <- aggregate.segmentation(segs.expanded)
+    segs.agg.reduced <- reduce.segmentation(segs.aggregated)
+    
+    segs.agg.reduced$chr <- factor(segs.agg.reduced$chr,levels = c(1:22,"X"))
+    p <- ggplot(segs.agg.reduced) + aes(xmin=start,xmax=end,ymin=0,ymax=V1,fill=V1<0) + geom_rect() +
+      ylim(-1,1) + facet_grid(~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+      theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none") +
+      ggtitle(paste0("Patient ",p.ID," (N = ",length(segs),")"))
+    ggsave(file=paste0(project.dir,"results/detect/plots/ichorCNA.circus.comb/",p.ID,".pdf"),plot=p,width = 10, height = 10)
+  }
+}
+```
+
+## CN driver - Patient Longitudial 
+ 
+```{r,eval=F}
+x <- cbind(detect$sWG.meta,copy.number)
+
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+i <- i[ merge(detect$sWG.meta,detect$ichorCNA.summary,sort=F)[i][,.I[which.min(n_est)],Patient.ID][,V1] ]
+
+copy.number <- cbind(detect$sWG.meta,copy.number)
+copy.number <- copy.number[Sample.type=="ctDNA"]
+copy.number <- melt(copy.number,id.vars = c("Sample.name","Sample.num","Sample.type","Patient.ID","n_est"))
+copy.number <- copy.number[order(as.numeric(Patient.ID),Sample.num)]
+copy.number[n_est == 1, value:=2]
+copy.number$value <- factor(copy.number$value)
+
+cols <- c("steelblue","grey85","orange","orangered","red")
+names(cols) <- 1:5
+
+for(p.ID in y[,unique(Patient.ID)]){
+  p2 <- ggplot(y[Patient.ID==p.ID]) + aes(x=factor(Sample.num),y=1-n_est) + geom_col() +
+        ylim(0,1) + theme_bw() + ylab("IchorCNA\nTumour Fraction") +
+        theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),axis.title.x = element_blank())
+  
+  #scale_x <- as.character(y[Patient.ID==p.ID,interaction(Patient.ID,Sample.num,sep=":",drop=T,lex.order = T)])
+  
+  p1 <- ggplot(copy.number[Patient.ID==p.ID]) + aes(x=factor(interaction(Patient.ID,Sample.num,sep=":",drop=T,lex.order = T)),y=variable,fill=factor(value)) + geom_tile(color="white") +
+        theme_grey() + scale_fill_manual(values=cols,na.value="black",name="Copy\nNumber") + 
+        theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5,size=5),legend.position = "bottom",axis.title = element_blank())
+  
+  gA=ggplot_gtable(ggplot_build(p1))
+  gB=ggplot_gtable(ggplot_build(p2))
+  
+  maxWidth = grid::unit.pmax(gA$widths, gB$widths)
+  gA$widths <- as.list(maxWidth)
+  gB$widths <- as.list(maxWidth)
+  
+  pdf(paste0(project.dir,"results/detect/plots/ichorCNA.gene.CN/",p.ID,".pdf"))
+  grid.arrange(
+   arrangeGrob(gB,gA,nrow=2,heights=c(.2,.8))
+  )
+  dev.off()
+}
+```
+
+## All patient-combined
+
+```{r}
+chromo <- seqlengths(Hsapiens)[1:23]
+chromo <- data.table(chr=factor(substr(names(chromo),4,6),levels = c(1:22,"X")),start=1,end=as.numeric(chromo),V1=0)
+
+i <- detect$sWG.meta[,which(Sample.type=="PT")]
+i <- i[ detect$sWG.meta[i][,.I[which.max(Mapped.reads)],Patient.ID][,V1] ]
+segs.PT <- get_segs(i)
+segs.PT$agg.reduced$gain$sample.type <- paste0("Primary (",length(i),")")
+segs.PT$agg.reduced$loss$sample.type <- paste0("Primary (",length(i),")")
+
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+i <- i[ merge(detect$sWG.meta,detect$ichorCNA.summary,sort=F)[i][,.I[which.min(n_est)],Patient.ID][,V1] ]
+segs.ctDNA <- get_segs(i)
+segs.ctDNA$agg.reduced$gain$sample.type <- paste0("ctDNA (",length(i),")")
+segs.ctDNA$agg.reduced$loss$sample.type <- paste0("ctDNA (",length(i),")")
+
+segs.agg.reduced <- list(
+  gain = rbind(segs.ctDNA$agg.reduced$gain,segs.PT$agg.reduced$gain),
+  loss = rbind(segs.ctDNA$agg.reduced$loss,segs.PT$agg.reduced$loss)
+)
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+p <- ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none")
+p
+```
+
+```{r}
+p <- ggplot() + aes(x=start,xend=end,y=V1,yend=V1) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$gain) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$loss) +
+  geom_hline(yintercept=0,linetype="dashed",colour="black") +
+  ylim(-1,1) + facet_grid(~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="bottom") +
+  scale_color_brewer(palette="Dark2") + xlab("") + ylab("")
+p
+```
+
+# Metabric - ichor Pipeline
+
+## Load
+
+```{r}
+bestModelIndex <- function(x){
+  if (env.vars$estimateScPrevalence){ 
+    fracInd <- which(
+      x$LLs[, "Frac_CNA_subclonal"] <= env.vars$maxFracCNASubclone & 
+      x$LLs[, "Frac_genome_subclonal"] <= env.vars$maxFracGenomeSubclone
+    )
+    if (length(fracInd) > 0){
+      return( fracInd[order(x$LLs[fracInd, "loglik"], decreasing=TRUE)][1] )
+    }else{
+      return(1)
+    }
+  }else{
+    return(1)
+  }
+}
+
+metabric <- list(
+  meta = rbind(
+    fread(paste0(root.dir,"metabric/data/metabric_clinical_1.tsv")),
+    fread(paste0(root.dir,"metabric/data/metabric_clinical_2.tsv"))
+  )[METABRIC_ID %in% gsub(".RDS","",list.files(paste0(project.dir,"data/metabric.ichor")))]
+)
+
+x <- lapply(metabric$meta$METABRIC_ID, function(sample.ID){
+  x <- readRDS(paste0(project.dir,"data/metabric.ichor/",sample.ID,".RDS"))
+  i <- bestModelIndex(x)
+  list(
+    summary = x$LLs[i,,drop=F],
+    model = x$models[[i]]
+  )
+})
+
+metabric$meta <- cbind(metabric$meta,rbindlist(lapply(x, "[[","summary")))
+metabric$ichor <-lapply(x, "[[","model")
+rm(x)
+```
+
+## Summary plot
+
+```{r}
+her2.samples <- metabric$meta[,.I[Her2.Expr=="+"]]
+her2.samples <- lapply(her2.samples, function(j) {
+    x <- data.table(metabric$ichor[[j]]$results$segs[[1]])
+    if(metabric$meta[j,n_est]==1) x[,copy.number:=2]
+    return(x)
+})
+
+her2.samples <- process.segs(her2.samples)
+her2.samples$agg.reduced$gain$sample.type <- paste0("Metabric (",length(her2.samples$raw),")")
+her2.samples$agg.reduced$loss$sample.type <- paste0("Metabric (",length(her2.samples$raw),")")
+
+chr.max <- segs.ctDNA$agg.reduced$gain[,max(end),chr]
+for(i in 1:nrow(chr.max)){
+  her2.samples$agg.reduced$gain <- her2.samples$agg.reduced$gain[(chr == chr.max[i,chr] & start < chr.max[i,V1]) | chr != chr.max[i,chr]]
+  her2.samples$agg.reduced$gain[chr == chr.max[i,chr] & end > chr.max[i,V1],end:=chr.max[i,V1]]
+  her2.samples$agg.reduced$loss <- her2.samples$agg.reduced$loss[(chr == chr.max[i,chr] & start < chr.max[i,V1]) | chr != chr.max[i,chr]]
+  her2.samples$agg.reduced$loss[chr == chr.max[i,chr] & end > chr.max[i,V1],end:=chr.max[i,V1]]
+}
+
+chr.min <- segs.ctDNA$agg.reduced$gain[,min(start),chr]
+for(i in 1:nrow(chr.min)){
+  her2.samples$agg.reduced$gain <- her2.samples$agg.reduced$gain[(chr == chr.min[i,chr] & end > chr.min[i,V1]) | chr != chr.min[i,chr]]
+  her2.samples$agg.reduced$gain[chr == chr.min[i,chr] & start < chr.min[i,V1],start:=chr.min[i,V1]]
+  her2.samples$agg.reduced$loss <- her2.samples$agg.reduced$loss[(chr == chr.min[i,chr] & end > chr.min[i,V1]) | chr != chr.min[i,chr]]
+  her2.samples$agg.reduced$loss[chr == chr.min[i,chr] & start < chr.min[i,V1],start:=chr.min[i,V1]]
+}
+
+segs.agg.reduced <- list(
+  gain = rbind(segs.ctDNA$agg.reduced$gain,segs.PT$agg.reduced$gain,her2.samples$agg.reduced$gain),
+  loss = rbind(segs.ctDNA$agg.reduced$loss,segs.PT$agg.reduced$loss,her2.samples$agg.reduced$loss)
+)
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+(p <- ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none",panel.grid = element_blank())
+)
+
+ggsave("~/Desktop/detect.metabric.gains.losses.png",p,dpi=300)
+```
+
+```{r}
+p <- ggplot() + aes(x=start,xend=end,y=V1,yend=V1) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$gain) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$loss) +
+  geom_hline(yintercept=0,linetype="dashed",colour="black") +
+  ylim(-1,1) + facet_grid(~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="bottom") +
+  scale_color_brewer(palette="Dark2") + xlab("") + ylab("")
+p
+```
+
+## Correlation
+
+```{r}
+x <- merge(merge(segs.ctDNA$aggregated,segs.PT$aggregated,by=c("chr","start"),all=T),her2.samples$aggregated,all=T)
+gains <- x[,c(1:2,which(grepl("V1",names(x)))),with=F]
+names(gains)[3:5] <- c("ctDNA","Biopsy","Metabric")
+losses <- x[,c(1:2,which(grepl("V2",names(x)))),with=F]
+names(losses)[3:5] <- c("ctDNA","Biopsy","Metabric")
+
+gains$chr <- factor(gains$chr,levels = c(1:22,"X"))
+losses$chr <- factor(losses$chr,levels = c(1:22,"X"))
+
+cor(gains[,3:5],use="pairwise.complete.obs")
+cor(losses[,3:5],use="pairwise.complete.obs")
+
+(p1 <- ggcorr(gains[,3:5],label=TRUE,label_round = 2))
+(p2 <- ggcorr(losses[,3:5],label=TRUE,label_round = 2))
+
+ggsave("~/Desktop/detect.metabric.gains.losses.cors.png",ggarrange(p1,p2,nrow=2),width=3,dpi=300)
+```
+
+```{r}
+x <- by(gains[,3:5],gains$chr,cor,use="pairwise.complete.obs")
+x <- lapply(x, function(x) {x[upper.tri(x)] <- NA; x})
+x <- rbindlist(lapply(x, melt),idcol = "chr")
+x <- x[Var1!=Var2]
+x <- x[!is.na(value)]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x[,median(value),.(Var1,Var2)]
+x[,.SD[which(value==min(value))],.(Var1,Var2)]
+ggplot(x) + aes(x=chr,y=value) + geom_col() + facet_grid(interaction(Var1,Var2)~.) + ylim(-1,1) + theme_tufte()
+```
+
+
+```{r}
+x <- by(losses[,3:5],gains$chr,cor,use="pairwise.complete.obs")
+x <- lapply(x, function(x) {x[upper.tri(x)] <- NA; x})
+x <- rbindlist(lapply(x, melt),idcol = "chr")
+x <- x[Var1!=Var2]
+x <- x[!is.na(value)]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x[,median(value),.(Var1,Var2)]
+x[,.SD[which(value==min(value))],.(Var1,Var2)]
+ggplot(x) + aes(x=chr,y=value) + geom_col() + facet_grid(interaction(Var1,Var2)~.) + ylim(-1,1) + theme_bw()
+```
+
+## CN driver genes
+
+```{r}
+#mut.driver.genes <- scan(paste0(project.dir,"data/bp-ts-mutdriver.txt"),what="",sep="\n")
+mut.driver.genes <-jsonlite::fromJSON(paste0(project.dir,"data/PBCP_geneTierList_March2019.json"))$TIER1
+mut.driver.genes <- mapIds(org.Hs.eg.db,keys=mut.driver.genes,column="ENTREZID",keytype = "ALIAS")
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Tx.genes <- genes(Tx.Db)
+Tx.genes <- Tx.genes[Tx.genes$gene_id %in% mut.driver.genes]
+seqlevels(Tx.genes) <- gsub("chr","",seqlevels(Tx.genes))
+Tx.genes <- Tx.genes[order(Tx.genes)] 
+Tx.genes$gene_id <- names(mut.driver.genes)[match(Tx.genes$gene_id,mut.driver.genes)]
+
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+i <- i[ merge(detect$sWG.meta,detect$ichorCNA.summary,sort=F)[i][,.I[which.min(n_est)],Patient.ID][,V1] ]
+
+copy.number <- list()
+copy.number$detect <- rbindlist(lapply(detect$ichorCNA.bestModels[i], function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$detect[,AKT1:=NULL]
+
+copy.number$metabric <- rbindlist(lapply(her2.samples$raw, function(x){
+  segs <- makeGRangesFromDataFrame(x,keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$metabric[,AKT1:=NULL]
+```
+
+## Detect vs. Metabric
+
+```{r}
+x <- rbindlist(copy.number,idcol = "study")
+x <- cbind(
+  "gene"=rep(names(x)[-(1:2)],4),
+  rbind(
+    x[,-2][,apply(.SD,2,function(x) mean(x>2,na.rm=T)),study][,.(study,CN="Gain","frac"=V1)],
+    x[,-2][,apply(.SD,2,function(x) mean(x<2,na.rm=T)),study][,.(study,CN="Loss","frac"=-V1)]
+  ),
+  "p.val"=c(
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] > 2), table(copy.number$metabric[,i,with=F] > 2)))$p.val
+    })),2),
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] < 2), table(copy.number$metabric[,i,with=F] < 2)))$p.val
+    })),2)
+  )
+)
+
+y <- x[p.val<0.01 & CN=="Gain",.(CN,study="detect",frac=max(frac)),gene]
+z <- x[p.val<0.01 & CN=="Loss",.(CN,study="detect",frac=min(frac)),gene]
+
+(p <- ggplot(x) + aes(x=gene,y=frac,fill=study) + geom_col(position="dodge") + facet_grid(CN~.,scales="free") + theme_bw(20) + theme(panel.grid = element_blank(),axis.text.x = element_text(angle=90,hjust=1,vjust=0.5),legend.position = "top",panel.grid.major.y  = element_line(colour = "grey60",size=0.1,linetype = "dashed")) +  scale_y_continuous(labels = scales::percent) + labs(x="",y="") +  scale_fill_discrete(name="",labels=c(paste0("Detect (N=",nrow(copy.number$detect),")"),paste0("Metabric (N=",nrow(copy.number$metabric),")"))) + geom_text(data=y,label="*",size=5) + geom_text(data=z,label="*",nudge_y = -0.04,size=5))
+
+ggsave("~/Desktop/detect.metabric.driver.CN.png",p,dpi=300,width=11,height = 6)
+```
+ 
+
+## GWAS(ish)
+
+```{r}
+get.gl.counts <- function(segs.expanded){
+  x <- segs.expanded[,-(1:2)]
+  N <- ncol(x)
+  x <- cbind(segs.expanded[,1:2],V1=rowSums(x<2,na.rm=T),V2=rowSums(x>2,na.rm=T),V3=rowSums(is.na(x)))
+  
+  print(paste("Removed rows in aggregation:",nrow(x[V3>(N/10)]), "out of", nrow(x)))
+  
+  x[V3>(N/10),V1:=NA]
+  x[V3>(N/10),V2:=NA]
+  x[is.na(V2),V3:=NA]
+    
+  x[,V1:=na.locf(V1)]
+  x[,V2:=na.locf(V2)]
+  x[,V3:=na.locf(V3)]
+  
+  x[,V3:=N-V3]
+  
+  return(x)
+}
+
+x <- get.gl.counts(segs.ctDNA$expanded)
+y <- get.gl.counts((her2.samples$expanded))
+x <- merge(x,y,by=c("chr","start"))
+
+x[,p.val.l:=fisher.test(matrix(c(V1.x,V3.x,V1.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.loss <- p.adjust(x$p.val.l,method="fdr")
+
+x[,p.val.g:=fisher.test(matrix(c(V2.x,V3.x,V2.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.gain <- p.adjust(x$p.val.g,method="fdr")
+
+if(1){
+  x$chr <- factor(x$chr,levels = c(1:22,"X"))
+  x <- x[order(chr,start)]
+  x[,index:=.I]
+  odd.chr <- levels(x$chr)[(seq_along(levels(x$chr)) %% 2) == 1]
+  x[,chr.alt:=chr %in% odd.chr]
+  xbreaks <- x[,floor(median(index)),chr]
+  
+  y <- melt(x,id.vars = c("chr","start","index","chr.alt"),measure.vars = c("adj.p.val.gain","adj.p.val.loss"))
+  
+  y[,value:=-log10(value)]
+  y[variable=="adj.p.val.loss",value:=-value]
+  levels(y$variable) <- c("Gain","Loss")
+  
+  scale.pad <- y[,.(chr.alt=TRUE,index=1,variable=unique(variable),value=max(abs(value)))]
+  scale.pad[variable=="Loss",value:=-value]
+  
+  y.breaks <- seq(-ceiling(scale.pad$value[1]),ceiling(scale.pad$value[1]),.5)
+  
+  (p <- ggplot(y) + aes(x=index,y=value,colour=as.factor(chr.alt)) + geom_point() + geom_point(data=y[abs(value)>-log10(0.05)],colour="firebrick") + geom_blank(data=scale.pad) + scale_x_continuous(name = "",breaks = xbreaks$V1, labels = xbreaks$chr,expand = c(0,0)) + scale_color_grey() + scale_y_continuous(name="-log10(adj.p.val)",breaks=y.breaks,labels = as.character(abs(y.breaks))) + theme_bw() + theme(panel.grid = element_blank(),legend.position = "none") + facet_grid(variable~.,scales = "free_y"))
+  
+}
+
+ggsave("~/Desktop/detect.metabric.gwas.png",p,dpi=300,width=11,height = 6)
+```
+
+
+
+# Metabric - ascat + paper thresholds
+
+## Load
+
+```{R}
+#Metabric processed with ascat
+metabric <- list(
+  meta = fread(paste0(root.dir,"metabric/data/patientData.txt")),
+  cna = fread(paste0(root.dir,"metabric/data/ascatSegments.txt"))
+)
+```
+
+## Summary plot
+
+```{r}
+her2.samples <- metabric$meta[her2Status=="POS",sample]
+her2.samples <- metabric$cna[sample %in% her2.samples]
+her2.samples <- by(her2.samples,her2.samples[,sample],function(x){
+  x <- x[,.(chr=gsub("chr","",chr),start=floor(start/1E6)*1E6 + 1,end=floor(end/1E6)*1E6,copy.number=log2((nMajor + nMinor)/ploidy))]
+  x <- x[start<end]
+  x[,copy.number:=ifelse(copy.number>(.4),3,ifelse(copy.number<(-0.5),1,2))]
+  x[chr==23,chr:="X"]
+  data.table(x)
+})
+
+her2.samples <- process.segs(her2.samples)
+her2.samples$agg.reduced$gain$sample.type <- paste0("Metabric (",length(her2.samples$raw),")")
+her2.samples$agg.reduced$loss$sample.type <- paste0("Metabric (",length(her2.samples$raw),")")
+
+chr.max <- segs.ctDNA$agg.reduced$gain[,max(end),chr]
+for(i in 1:nrow(chr.max)){
+  her2.samples$agg.reduced$gain <- her2.samples$agg.reduced$gain[(chr == chr.max[i,chr] & start < chr.max[i,V1]) | chr != chr.max[i,chr]]
+  her2.samples$agg.reduced$gain[chr == chr.max[i,chr] & end > chr.max[i,V1],end:=chr.max[i,V1]]
+  her2.samples$agg.reduced$loss <- her2.samples$agg.reduced$loss[(chr == chr.max[i,chr] & start < chr.max[i,V1]) | chr != chr.max[i,chr]]
+  her2.samples$agg.reduced$loss[chr == chr.max[i,chr] & end > chr.max[i,V1],end:=chr.max[i,V1]]
+}
+
+chr.min <- segs.ctDNA$agg.reduced$gain[,min(start),chr]
+for(i in 1:nrow(chr.min)){
+  her2.samples$agg.reduced$gain <- her2.samples$agg.reduced$gain[(chr == chr.min[i,chr] & end > chr.min[i,V1]) | chr != chr.min[i,chr]]
+  her2.samples$agg.reduced$gain[chr == chr.min[i,chr] & start < chr.min[i,V1],start:=chr.min[i,V1]]
+  her2.samples$agg.reduced$loss <- her2.samples$agg.reduced$loss[(chr == chr.min[i,chr] & end > chr.min[i,V1]) | chr != chr.min[i,chr]]
+  her2.samples$agg.reduced$loss[chr == chr.min[i,chr] & start < chr.min[i,V1],start:=chr.min[i,V1]]
+}
+
+segs.agg.reduced <- list(
+  gain = rbind(segs.ctDNA$agg.reduced$gain,segs.PT$agg.reduced$gain,her2.samples$agg.reduced$gain),
+  loss = rbind(segs.ctDNA$agg.reduced$loss,segs.PT$agg.reduced$loss,her2.samples$agg.reduced$loss)
+)
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+(p <- ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none",panel.grid = element_blank())
+)
+
+ggsave("~/Desktop/detect.metabric.gains.losses.png",p,dpi=300)
+```
+
+```{r,eval=F}
+p <- ggplot() + aes(x=start,xend=end,y=V1,yend=V1) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$gain) + 
+  geom_step(aes(colour=sample.type),data=segs.agg.reduced$loss) +
+  geom_hline(yintercept=0,linetype="dashed",colour="black") +
+  ylim(-1,1) + facet_grid(~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="bottom") +
+  scale_color_brewer(palette="Dark2") + xlab("") + ylab("")
+p
+```
+
+## Correlation
+
+```{r}
+x <- merge(merge(segs.ctDNA$aggregated,segs.PT$aggregated,by=c("chr","start"),all=T),her2.samples$aggregated,all=T)
+gains <- x[,c(1:2,which(grepl("V1",names(x)))),with=F]
+names(gains)[3:5] <- c("ctDNA","Biopsy","Metabric")
+losses <- x[,c(1:2,which(grepl("V2",names(x)))),with=F]
+names(losses)[3:5] <- c("ctDNA","Biopsy","Metabric")
+
+gains$chr <- factor(gains$chr,levels = c(1:22,"X"))
+losses$chr <- factor(losses$chr,levels = c(1:22,"X"))
+
+cor(gains[,3:5],use="pairwise.complete.obs")
+cor(losses[,3:5],use="pairwise.complete.obs")
+
+(p1 <- ggcorr(gains[,3:5],label=TRUE,label_round = 2))
+(p2 <- ggcorr(losses[,3:5],label=TRUE,label_round = 2))
+
+ggsave("~/Desktop/detect.metabric.gains.losses.cors.png",ggarrange(p1,p2,nrow=2),width=3,dpi=300)
+```
+
+```{r}
+x <- by(gains[,3:5],gains$chr,cor,use="pairwise.complete.obs")
+x <- lapply(x, function(x) {x[upper.tri(x)] <- NA; x})
+x <- rbindlist(lapply(x, melt),idcol = "chr")
+x <- x[Var1!=Var2]
+x <- x[!is.na(value)]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x[,median(value),.(Var1,Var2)]
+x[,.SD[which(value==min(value))],.(Var1,Var2)]
+ggplot(x) + aes(x=chr,y=value) + geom_col() + facet_grid(interaction(Var1,Var2)~.) + ylim(-1,1) + theme_tufte()
+```
+
+
+```{r}
+x <- by(losses[,3:5],gains$chr,cor,use="pairwise.complete.obs")
+x <- lapply(x, function(x) {x[upper.tri(x)] <- NA; x})
+x <- rbindlist(lapply(x, melt),idcol = "chr")
+x <- x[Var1!=Var2]
+x <- x[!is.na(value)]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x[,median(value),.(Var1,Var2)]
+x[,.SD[which(value==min(value))],.(Var1,Var2)]
+ggplot(x) + aes(x=chr,y=value) + geom_col() + facet_grid(interaction(Var1,Var2)~.) + ylim(-1,1) + theme_bw()
+```
+
+## CN driver genes
+
+```{r}
+#mut.driver.genes <- scan(paste0(project.dir,"data/bp-ts-mutdriver.txt"),what="",sep="\n")
+mut.driver.genes <-jsonlite::fromJSON(paste0(project.dir,"data/PBCP_geneTierList_March2019.json"))$TIER1
+mut.driver.genes <- mapIds(org.Hs.eg.db,keys=mut.driver.genes,column="ENTREZID",keytype = "ALIAS")
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Tx.genes <- genes(Tx.Db)
+Tx.genes <- Tx.genes[Tx.genes$gene_id %in% mut.driver.genes]
+seqlevels(Tx.genes) <- gsub("chr","",seqlevels(Tx.genes))
+Tx.genes <- Tx.genes[order(Tx.genes)] 
+Tx.genes$gene_id <- names(mut.driver.genes)[match(Tx.genes$gene_id,mut.driver.genes)]
+
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+i <- i[ merge(detect$sWG.meta,detect$ichorCNA.summary,sort=F)[i][,.I[which.min(n_est)],Patient.ID][,V1] ]
+
+copy.number <- list()
+copy.number$detect <- rbindlist(lapply(detect$ichorCNA.bestModels[i], function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$detect[,AKT1:=NULL]
+
+copy.number$metabric <- rbindlist(lapply(her2.samples$raw, function(x){
+  segs <- makeGRangesFromDataFrame(x,keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$metabric[,AKT1:=NULL]
+```
+
+## Detect vs. Metabric
+
+```{r}
+x <- rbindlist(copy.number,idcol = "study")
+x <- cbind(
+  "gene"=rep(names(x)[-(1:2)],4),
+  rbind(
+    x[,-2][,apply(.SD,2,function(x) mean(x>2,na.rm=T)),study][,.(study,CN="Gain","frac"=V1)],
+    x[,-2][,apply(.SD,2,function(x) mean(x<2,na.rm=T)),study][,.(study,CN="Loss","frac"=-V1)]
+  ),
+  "p.val"=c(
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] > 2), table(copy.number$metabric[,i,with=F] > 2)))$p.val
+    })),2),
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] < 2), table(copy.number$metabric[,i,with=F] < 2)))$p.val
+    })),2)
+  )
+)
+
+y <- x[p.val<0.01 & CN=="Gain",.(CN,study="detect",frac=max(frac)),gene]
+z <- x[p.val<0.01 & CN=="Loss",.(CN,study="detect",frac=min(frac)),gene]
+
+(p <- ggplot(x) + aes(x=gene,y=frac,fill=study) + geom_col(position="dodge") + facet_grid(CN~.,scales="free") + theme_bw(20) + theme(panel.grid = element_blank(),axis.text.x = element_text(angle=90,hjust=1,vjust=0.5),legend.position = "top",panel.grid.major.y  = element_line(colour = "grey60",size=0.1,linetype = "dashed")) +  scale_y_continuous(labels = scales::percent) + labs(x="",y="") +  scale_fill_discrete(name="",labels=c(paste0("Detect (N=",nrow(copy.number$detect),")"),paste0("Metabric (N=",nrow(copy.number$metabric),")"))) + geom_text(data=y,label="*",size=5) + geom_text(data=z,label="*",nudge_y = -0.04,size=5))
+
+ggsave("~/Desktop/detect.metabric.driver.CN.png",p,dpi=300,width=11,height = 6)
+```
+ 
+
+## GWAS(ish)
+
+```{r}
+get.gl.counts <- function(segs.expanded){
+  x <- segs.expanded[,-(1:2)]
+  N <- ncol(x)
+  x <- cbind(segs.expanded[,1:2],V1=rowSums(x<2,na.rm=T),V2=rowSums(x>2,na.rm=T),V3=rowSums(is.na(x)))
+  
+  print(paste("Removed rows in aggregation:",nrow(x[V3>(N/10)]), "out of", nrow(x)))
+  
+  x[V3>(N/10),V1:=NA]
+  x[V3>(N/10),V2:=NA]
+  x[is.na(V2),V3:=NA]
+    
+  x[,V1:=na.locf(V1)]
+  x[,V2:=na.locf(V2)]
+  x[,V3:=na.locf(V3)]
+  
+  x[,V3:=N-V3]
+  
+  return(x)
+}
+
+x <- get.gl.counts(segs.ctDNA$expanded)
+y <- get.gl.counts((her2.samples$expanded))
+x <- merge(x,y,by=c("chr","start"))
+
+x[,p.val.l:=fisher.test(matrix(c(V1.x,V3.x,V1.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.loss <- p.adjust(x$p.val.l,method="fdr")
+
+x[,p.val.g:=fisher.test(matrix(c(V2.x,V3.x,V2.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.gain <- p.adjust(x$p.val.g,method="fdr")
+
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x <- x[order(chr,start)]
+x[,index:=.I]
+odd.chr <- levels(x$chr)[(seq_along(levels(x$chr)) %% 2) == 1]
+x[,chr.alt:=chr %in% odd.chr]
+xbreaks <- x[,floor(median(index)),chr]
+
+y <- melt(x,id.vars = c("chr","start","index","chr.alt"),measure.vars = c("adj.p.val.gain","adj.p.val.loss"))
+
+y[,value:=-log10(value)]
+y[variable=="adj.p.val.loss",value:=-value]
+levels(y$variable) <- c("Gain","Loss")
+
+scale.pad <- y[,.(chr.alt=TRUE,index=1,variable=unique(variable),value=max(abs(value)))]
+scale.pad[variable=="Loss",value:=-value]
+
+y.breaks <- seq(-ceiling(scale.pad$value[1]),ceiling(scale.pad$value[1]))
+
+loss.labels <- y[variable=="Loss",.SD[which.min(value)],chr][value<log10(0.05)]
+gain.labels <- y[variable=="Gain",.SD[which.max(value)],chr][value>-log10(0.05)]
+
+cytobands <- fread(paste0(project.dir,"data/cytoBand.txt"))
+cytobands[,chr:=gsub("chr","",V1)]
+gain.labels$cytoband <- cytobands[gain.labels[,which((chr == cytobands$chr) & (start > cytobands$V2) & (start < cytobands$V3)),chr][,V1],V4]
+loss.labels$cytoband <- cytobands[loss.labels[,which((chr == cytobands$chr) & (start > cytobands$V2) & (start < cytobands$V3)),chr][,V1],V4]
+
+(p <- ggplot(y) + aes(x=index,y=value,colour=as.factor(chr.alt)) + geom_point() + geom_point(data=y[abs(value)>-log10(0.05)],colour="firebrick") +
+    geom_label(data=loss.labels,aes(label=cytoband),colour="black",nudge_y = -.3,nudge_x = 50) + geom_label(data=gain.labels,aes(label=cytoband),colour="black",nudge_y = .3,nudge_x = 50) + 
+    geom_blank(data=scale.pad) + scale_x_continuous(name = "",breaks = xbreaks$V1, labels = xbreaks$chr,expand = c(0,0)) + scale_color_grey() + scale_y_continuous(name="-log10(adj.p.val)",breaks=y.breaks,labels = as.character(abs(y.breaks))) + theme_bw() + theme(panel.grid = element_blank(),legend.position = "none") + facet_grid(variable~.,scales = "free_y"))
+
+ggsave("~/Desktop/detect.metabric.gwas.png",p,dpi=300,width=11,height = 6)
+```
+
+
+# Metabric - ascat + proportional thresholds
+
+## Load
+
+```{R}
+#Metabric processed with ascat
+metabric <- list(
+  meta = fread(paste0(root.dir,"metabric/data/patientData.txt")),
+  cna = fread(paste0(root.dir,"metabric/data/ascatSegments.txt"))
+)
+```
+
+```{r}
+generate.her2.agg <- function(her2.samples,gain.thresh=0.4,loss.thresh=-0.5){
+  her2.samples <- by(her2.samples,her2.samples[,sample],function(x){
+    x <- x[,.(chr=gsub("chr","",chr),start=floor(start/1E6)*1E6 + 1,end=floor(end/1E6)*1E6,copy.number=log2((nMajor + nMinor)/ploidy))]
+    x <- x[start<end]
+    x[,copy.number:=ifelse(copy.number>gain.thresh,3,ifelse(copy.number<loss.thresh,1,2))]
+    x[chr==23,chr:="X"]
+    data.table(x)
+  })
+  
+  her2.samples <- process.segs(her2.samples)
+  her2.samples$agg.reduced$gain$sample.type <- paste0("Metabric (",length(her2.samples$raw),")")
+  her2.samples$agg.reduced$loss$sample.type <- paste0("Metabric (",length(her2.samples$raw),")")
+  
+  chr.max <- segs.ctDNA$agg.reduced$gain[,max(end),chr]
+  for(i in 1:nrow(chr.max)){
+    her2.samples$agg.reduced$gain <- her2.samples$agg.reduced$gain[(chr == chr.max[i,chr] & start < chr.max[i,V1]) | chr != chr.max[i,chr]]
+    her2.samples$agg.reduced$gain[chr == chr.max[i,chr] & end > chr.max[i,V1],end:=chr.max[i,V1]]
+    her2.samples$agg.reduced$loss <- her2.samples$agg.reduced$loss[(chr == chr.max[i,chr] & start < chr.max[i,V1]) | chr != chr.max[i,chr]]
+    her2.samples$agg.reduced$loss[chr == chr.max[i,chr] & end > chr.max[i,V1],end:=chr.max[i,V1]]
+  }
+  
+  chr.min <- segs.ctDNA$agg.reduced$gain[,min(start),chr]
+  for(i in 1:nrow(chr.min)){
+    her2.samples$agg.reduced$gain <- her2.samples$agg.reduced$gain[(chr == chr.min[i,chr] & end > chr.min[i,V1]) | chr != chr.min[i,chr]]
+    her2.samples$agg.reduced$gain[chr == chr.min[i,chr] & start < chr.min[i,V1],start:=chr.min[i,V1]]
+    her2.samples$agg.reduced$loss <- her2.samples$agg.reduced$loss[(chr == chr.min[i,chr] & end > chr.min[i,V1]) | chr != chr.min[i,chr]]
+    her2.samples$agg.reduced$loss[chr == chr.min[i,chr] & start < chr.min[i,V1],start:=chr.min[i,V1]]
+  }
+  return(her2.samples)
+}
+
+calc.gain.frac.diff <- function(gain.thresh){
+  x <- generate.her2.agg(her2.samples,gain.thresh=gain.thresh)
+  return(abs(x$agg.reduced$gain[,sum((end-start)*V1)] - segs.ctDNA$agg.reduced$gain[,sum((end-start)*V1)]))
+}
+
+calc.loss.frac.diff <- function(loss.thresh){
+  x <- generate.her2.agg(her2.samples,loss.thresh = loss.thresh)
+  return(abs(x$agg.reduced$loss[,sum((end-start)*V1)] - segs.ctDNA$agg.reduced$loss[,sum((end-start)*V1)]))
+}
+
+her2.samples <- metabric$meta[her2Status=="POS",sample]
+her2.samples <- metabric$cna[sample %in% her2.samples]
+
+(opt.gain.thr <- optimise(calc.gain.frac.diff,interval = c(0,1),tol=1E-3))
+(opt.loss.thr <- optimise(calc.loss.frac.diff,interval = c(-1,0),tol=1E-3))
+
+her2.samples <- generate.her2.agg(her2.samples, gain.thresh=opt.gain.thr$minimum, loss.thresh=opt.loss.thr$minimum)
+
+```
+
+## Summary plot
+
+```{r}
+segs.agg.reduced <- list(
+  gain = rbind(segs.ctDNA$agg.reduced$gain,segs.PT$agg.reduced$gain,her2.samples$agg.reduced$gain),
+  loss = rbind(segs.ctDNA$agg.reduced$loss,segs.PT$agg.reduced$loss,her2.samples$agg.reduced$loss)
+)
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+(p <- ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") + geom_blank(data=chromo) +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none",panel.grid = element_blank())
+)
+
+ggsave("~/Desktop/detect.metabric.gains.losses.png",p,dpi=300)
+```
+
+
+## Correlation
+
+```{r}
+x <- merge(merge(segs.ctDNA$aggregated,segs.PT$aggregated,by=c("chr","start"),all=T),her2.samples$aggregated,all=T)
+gains <- x[,c(1:2,which(grepl("V1",names(x)))),with=F]
+names(gains)[3:5] <- c("ctDNA","Biopsy","Metabric")
+losses <- x[,c(1:2,which(grepl("V2",names(x)))),with=F]
+names(losses)[3:5] <- c("ctDNA","Biopsy","Metabric")
+
+gains$chr <- factor(gains$chr,levels = c(1:22,"X"))
+losses$chr <- factor(losses$chr,levels = c(1:22,"X"))
+
+cor(gains[,3:5],use="pairwise.complete.obs")
+cor(losses[,3:5],use="pairwise.complete.obs")
+
+(p1 <- ggcorr(gains[,3:5],label=TRUE,label_round = 2))
+(p2 <- ggcorr(losses[,3:5],label=TRUE,label_round = 2))
+
+ggsave("~/Desktop/detect.metabric.gains.losses.cors.png",ggarrange(p1,p2,nrow=2),width=3,dpi=300)
+```
+
+```{r}
+x <- by(gains[,3:5],gains$chr,cor,use="pairwise.complete.obs")
+x <- lapply(x, function(x) {x[upper.tri(x)] <- NA; x})
+x <- rbindlist(lapply(x, melt),idcol = "chr")
+x <- x[Var1!=Var2]
+x <- x[!is.na(value)]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x[,median(value),.(Var1,Var2)]
+x[,.SD[which(value==min(value))],.(Var1,Var2)]
+ggplot(x) + aes(x=chr,y=value) + geom_col() + facet_grid(interaction(Var1,Var2)~.) + ylim(-1,1) + theme_tufte()
+```
+
+
+```{r}
+x <- by(losses[,3:5],gains$chr,cor,use="pairwise.complete.obs")
+x <- lapply(x, function(x) {x[upper.tri(x)] <- NA; x})
+x <- rbindlist(lapply(x, melt),idcol = "chr")
+x <- x[Var1!=Var2]
+x <- x[!is.na(value)]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x[,median(value),.(Var1,Var2)]
+x[,.SD[which(value==min(value))],.(Var1,Var2)]
+ggplot(x) + aes(x=chr,y=value) + geom_col() + facet_grid(interaction(Var1,Var2)~.) + ylim(-1,1) + theme_bw()
+```
+
+## CN driver genes
+
+```{r}
+#mut.driver.genes <- scan(paste0(project.dir,"data/bp-ts-mutdriver.txt"),what="",sep="\n")
+mut.driver.genes <-jsonlite::fromJSON(paste0(project.dir,"data/PBCP_geneTierList_March2019.json"))$TIER1
+mut.driver.genes <- mapIds(org.Hs.eg.db,keys=mut.driver.genes,column="ENTREZID",keytype = "ALIAS")
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Tx.genes <- genes(Tx.Db)
+Tx.genes <- Tx.genes[Tx.genes$gene_id %in% mut.driver.genes]
+seqlevels(Tx.genes) <- gsub("chr","",seqlevels(Tx.genes))
+Tx.genes <- Tx.genes[order(Tx.genes)] 
+Tx.genes$gene_id <- names(mut.driver.genes)[match(Tx.genes$gene_id,mut.driver.genes)]
+
+i <- which(detect$sWG.meta$Sample.type=="ctDNA" & detect$ichorCNA.summary$n_est!=1)
+i <- i[ merge(detect$sWG.meta,detect$ichorCNA.summary,sort=F)[i][,.I[which.min(n_est)],Patient.ID][,V1] ]
+
+copy.number <- list()
+copy.number$detect <- rbindlist(lapply(detect$ichorCNA.bestModels[i], function(x){
+  segs <- makeGRangesFromDataFrame(x$results$segs[[1]],keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$detect[,AKT1:=NULL]
+
+copy.number$metabric <- rbindlist(lapply(her2.samples$raw, function(x){
+  segs <- makeGRangesFromDataFrame(x,keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$metabric[,AKT1:=NULL]
+```
+
+## Detect vs. Metabric
+
+```{r}
+x <- rbindlist(copy.number,idcol = "study")
+x <- cbind(
+  "gene"=rep(names(x)[-(1:2)],4),
+  rbind(
+    x[,-2][,apply(.SD,2,function(x) mean(x>2,na.rm=T)),study][,.(study,CN="Gain","frac"=V1)],
+    x[,-2][,apply(.SD,2,function(x) mean(x<2,na.rm=T)),study][,.(study,CN="Loss","frac"=-V1)]
+  ),
+  "p.val"=c(
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] > 2), table(copy.number$metabric[,i,with=F] > 2)))$p.val
+    })),2),
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] < 2), table(copy.number$metabric[,i,with=F] < 2)))$p.val
+    })),2)
+  )
+)
+
+y <- x[p.val<0.01 & CN=="Gain",.(CN,study="detect",frac=max(frac)),gene]
+z <- x[p.val<0.01 & CN=="Loss",.(CN,study="detect",frac=min(frac)),gene]
+
+(p <- ggplot(x) + aes(x=gene,y=frac,fill=study) + geom_col(position="dodge") + facet_grid(CN~.,scales="free") + theme_bw(20) + theme(panel.grid = element_blank(),axis.text.x = element_text(angle=90,hjust=1,vjust=0.5),legend.position = "top",panel.grid.major.y  = element_line(colour = "grey60",size=0.1,linetype = "dashed")) +  scale_y_continuous(labels = scales::percent) + labs(x="",y="") +  scale_fill_discrete(name="",labels=c(paste0("Detect (N=",nrow(copy.number$detect),")"),paste0("Metabric (N=",nrow(copy.number$metabric),")"))) + geom_text(data=y,label="*",size=5) + geom_text(data=z,label="*",nudge_y = -0.04,size=5))
+
+ggsave("~/Desktop/detect.metabric.driver.CN.png",p,dpi=300,width=11,height = 6)
+```
+ 
+
+## GWAS(ish)
+
+```{r}
+get.gl.counts <- function(segs.expanded){
+  x <- segs.expanded[,-(1:2)]
+  N <- ncol(x)
+  x <- cbind(segs.expanded[,1:2],V1=rowSums(x<2,na.rm=T),V2=rowSums(x>2,na.rm=T),V3=rowSums(is.na(x)))
+  
+  print(paste("Removed rows in aggregation:",nrow(x[V3>(N/10)]), "out of", nrow(x)))
+  
+  x[V3>(N/10),V1:=NA]
+  x[V3>(N/10),V2:=NA]
+  x[is.na(V2),V3:=NA]
+    
+  x[,V1:=na.locf(V1)]
+  x[,V2:=na.locf(V2)]
+  x[,V3:=na.locf(V3)]
+  
+  x[,V3:=N-V3]
+  
+  return(x)
+}
+
+x <- get.gl.counts(segs.ctDNA$expanded)
+y <- get.gl.counts((her2.samples$expanded))
+x <- merge(x,y,by=c("chr","start"))
+
+x[,p.val.l:=fisher.test(matrix(c(V1.x,V3.x,V1.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.loss <- p.adjust(x$p.val.l,method="fdr")
+
+x[,p.val.g:=fisher.test(matrix(c(V2.x,V3.x,V2.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.gain <- p.adjust(x$p.val.g,method="fdr")
+
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x <- x[order(chr,start)]
+x[,index:=.I]
+odd.chr <- levels(x$chr)[(seq_along(levels(x$chr)) %% 2) == 1]
+x[,chr.alt:=chr %in% odd.chr]
+xbreaks <- x[,floor(median(index)),chr]
+
+y <- melt(x,id.vars = c("chr","start","index","chr.alt"),measure.vars = c("adj.p.val.gain","adj.p.val.loss"))
+
+y[,value:=-log10(value)]
+y[variable=="adj.p.val.loss",value:=-value]
+levels(y$variable) <- c("Gain","Loss")
+
+scale.pad <- y[,.(chr.alt=TRUE,index=1,variable=unique(variable),value=max(abs(value)))]
+scale.pad[variable=="Loss",value:=-value]
+
+y.breaks <- seq(-ceiling(scale.pad$value[1]),ceiling(scale.pad$value[1]))
+
+loss.labels <- y[variable=="Loss",.SD[which.min(value)],chr][value<log10(0.05)]
+gain.labels <- y[variable=="Gain",.SD[which.max(value)],chr][value>-log10(0.05)]
+
+cytobands <- fread(paste0(project.dir,"data/cytoBand.txt"))
+cytobands[,chr:=gsub("chr","",V1)]
+gain.labels$cytoband <- cytobands[gain.labels[,which((chr == cytobands$chr) & (start > cytobands$V2) & (start < cytobands$V3)),chr][,V1],V4]
+loss.labels$cytoband <- cytobands[loss.labels[,which((chr == cytobands$chr) & (start > cytobands$V2) & (start < cytobands$V3)),chr][,V1],V4]
+
+(p <- ggplot(y) + aes(x=index,y=value,colour=as.factor(chr.alt)) + geom_point() + geom_point(data=y[abs(value)>-log10(0.05)],colour="firebrick") +
+    geom_label(data=loss.labels,aes(label=cytoband),colour="black",nudge_y = -.3,nudge_x = 50) + geom_label(data=gain.labels,aes(label=cytoband),colour="black",nudge_y = .3,nudge_x = 50) + 
+    geom_blank(data=scale.pad) + scale_x_continuous(name = "",breaks = xbreaks$V1, labels = xbreaks$chr,expand = c(0,0)) + scale_color_grey() + scale_y_continuous(name="-log10(adj.p.val)",breaks=y.breaks,labels = as.character(abs(y.breaks))) + theme_bw() + theme(panel.grid = element_blank(),legend.position = "none") + facet_grid(variable~.,scales = "free_y"))
+
+ggsave("~/Desktop/detect.metabric.gwas.png",p,dpi=300,width=11,height = 6)
+```

@@ -1,0 +1,835 @@
+---
+title: 'DETECT: NGTAS'
+author: "Alistair Martin"
+date: '`r format(Sys.time(), "Last modified: %d %b %Y")`'
+layout: page
+---
+
+# Load/generate data
+
+## Set up
+
+```{r 'setup', message=FALSE, warning=FALSE}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+
+knitr::opts_chunk$set(fig.path = paste0(project.dir,"results/detect/"), dev=c('png', 'pdf'))
+
+pkgs <- c("data.table","ggplot2","ggthemes","GGally","ggbio",
+          "gridExtra","ichorCNA","GenomicRanges","survival","survminer",
+          "penalized","org.Hs.eg.db","TxDb.Hsapiens.UCSC.hg19.knownGene",
+          "BSgenome.Hsapiens.UCSC.hg19","chngpt","ROCR")
+pkgs <- lapply(pkgs,function(pkg) suppressWarnings(suppressMessages(require(pkg, ch = TRUE))))
+                                  
+source(paste0(project.dir,"src/load.detect.R"))
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Org.Db <- org.Hs.eg.db
+
+detect <- detect.load(project.dir)
+```
+
+# Missing samples
+
+```{r, eval=F}
+p.IDs <- unique(c(
+  detect$RECIST$EMMA[,unique(patient.ID)],
+  detect$treatment[,unique(patient.ID)]
+))
+p.info <- data.table(patient.ID=p.IDs)
+
+p.info <- merge(p.info,detect$sWG.meta[Sample.type=="ctDNA",.(patient.ID=Patient.ID,Sample.num,sWG=TRUE)],by="patient.ID")
+
+p.info <- merge(p.info,detect$NGTAS.meta[Sample.type=="ctDNA",.(patient.ID=Patient.ID,Sample.num,NGTAS=TRUE)],by=c("patient.ID","Sample.num"),all=T,)
+
+p.info[is.na(p.info)] <- FALSE
+
+fwrite(p.info,"~/Desktop/DETECT.sample.list.csv")
+```
+
+```{r, eval=F}
+p.IDs <- unique(c(
+  detect$RECIST$EMMA[,unique(patient.ID)],
+  detect$treatment[,unique(patient.ID)]
+))
+p.info <- data.table(patient.ID=p.IDs)
+p.info[,RECIST:=patient.ID %in% detect$RECIST$EMMA[,unique(patient.ID)]]
+p.info[,treatmnet:=patient.ID %in% detect$treatment[,unique(patient.ID)]]
+
+p.info[,sWG.BC:=p.ID %in% detect$sWG.meta[Sample.type=="BC",Patient.ID],.(p.ID=patient.ID)]
+p.info[,sWG.PT:=p.ID %in% detect$sWG.meta[Sample.type=="MT",Patient.ID],.(p.ID=patient.ID)]
+p.info[,sWG.MT:=p.ID %in% detect$sWG.meta[Sample.type=="PT",Patient.ID],.(p.ID=patient.ID)]
+p.info[,sWG.ctDNA:=paste0(detect$sWG.meta[Patient.ID==p.ID & Sample.type=="ctDNA",Sample.num],collapse=","),.(p.ID=patient.ID)]
+
+x <- readLines(paste0(project.dir,"data/meta/detect/SLX-16863.sample.list.txt"))
+x <- unique(gsub("( |_)lib$","",gsub(" (a|b|c)$","",x)))
+x <- data.table(SampleID=x)
+x[grepl("\\d+_{0,1}V\\d+",SampleID),c("Patient.ID","Sample.num") :=
+    tstrsplit(regmatches(SampleID,regexpr("\\d+_{0,1}V\\d+",SampleID)),"V")]
+x[grepl("\\d+_PLASMA_V\\d+",SampleID),c("Patient.ID","Sample.num") :=
+    tstrsplit(regmatches(SampleID,regexpr("\\d+_PLASMA_V\\d+",SampleID)),"_PLASMA_V")]
+x[,Patient.ID:=gsub("_","",Patient.ID)]
+x[,Sample.num:=as.numeric(Sample.num)]
+x[!is.na(Patient.ID), Sample.type := "ctDNA"]
+x[is.na(Patient.ID), Patient.ID := regmatches(SampleID,regexpr("\\d+",SampleID))]
+x[,Patient.ID:=as.integer(Patient.ID)]
+x[grepl("BC",SampleID), Sample.type := "BC"]
+x[grepl("PT",SampleID), Sample.type := "PT"]
+x[grepl("MT",SampleID), Sample.type := "MT"]
+x <- rbind(x,detect$NGTAS.meta,fill=T)
+
+p.info[,NGTAS.BC:=p.ID %in% x[Sample.type=="BC",Patient.ID],.(p.ID=patient.ID)]
+p.info[,NGTAS.PT:=p.ID %in% x[Sample.type=="MT",Patient.ID],.(p.ID=patient.ID)]
+p.info[,NGTAS.MT:=p.ID %in% x[Sample.type=="PT",Patient.ID],.(p.ID=patient.ID)]
+p.info[,NGTAS.ctDNA:=paste0(x[Patient.ID==p.ID & Sample.type=="ctDNA",unique(sort(Sample.num))],collapse=","),.(p.ID=patient.ID)]
+```
+
+```{r, eval=F}
+p.IDs <- unique(c(
+  detect$RECIST$EMMA[,unique(patient.ID)],
+  detect$treatment[,unique(patient.ID)]
+))
+
+x <- readLines(paste0(project.dir,"data/meta/detect/SLX-16863.sample.list.txt"))
+x <- unique(gsub("( |_)lib$","",gsub(" (a|b|c)$","",x)))
+x <- data.table(SampleID=x)
+x[grepl("\\d+_{0,1}V\\d+",SampleID),c("Patient.ID","Sample.num") :=
+    tstrsplit(regmatches(SampleID,regexpr("\\d+_{0,1}V\\d+",SampleID)),"V")]
+x[grepl("\\d+_PLASMA_V\\d+",SampleID),c("Patient.ID","Sample.num") :=
+    tstrsplit(regmatches(SampleID,regexpr("\\d+_PLASMA_V\\d+",SampleID)),"_PLASMA_V")]
+x[,Patient.ID:=gsub("_","",Patient.ID)]
+x[,Sample.num:=as.numeric(Sample.num)]
+x[!is.na(Patient.ID), Sample.type := "ctDNA"]
+x[is.na(Patient.ID), Patient.ID := regmatches(SampleID,regexpr("\\d+",SampleID))]
+x[,Patient.ID:=as.integer(Patient.ID)]
+x[grepl("BC",SampleID), Sample.type := "BC"]
+x[grepl("PT",SampleID), Sample.type := "PT"]
+x[grepl("MT",SampleID), Sample.type := "MT"]
+x <- rbind(x,detect$NGTAS.meta,fill=T)
+
+y <- lapply(p.IDs, function(p.ID){
+  list(
+    sWG=paste(p.ID,detect$sWG.meta[Patient.ID==p.ID & Sample.type=="ctDNA",unique(Sample.num)],sep=":"),
+    NGTAS=x[Patient.ID==p.ID & Sample.type=="ctDNA",paste(Patient.ID,unique(Sample.num),sep = ":")]
+  )
+})
+venn(list(
+  NGTAS=unlist(lapply(y, "[[","NGTAS")),
+  sWG=unlist(lapply(y, "[[","sWG"))
+))
+```
+
+```{r}
+detect$sWG.meta[Sample.type=="ctDNA" & is.na(Date.collected)]
+detect$NGTAS.meta[Sample.type=="ctDNA" & is.na(Date.collected)]
+```
+
+# Progression-free surival (Andersen-Gill model)
+
+```{r}
+time.dependent.conc <- function(model,dt,id.name){
+  strata <- dt[[id.name]]
+  x <- survfit(model,newdata=dt,id=strata)
+  y <- dcast(data.table(
+                id=as.numeric(rep(names(x$strata),x$strata)),
+                time=x$time,
+                cumhaz=x$cumhaz
+              ),time~id)
+  z <- dt[,.(sum(event),tail(event.date,1)),id.name]
+  
+  n <- length(z$patient.ID)
+  conc <- as.list(table(unlist(lapply(1:n, function(i){
+    sapply(i:n,function(j){
+      if(i==j) return(NA)
+      k <- c(i,j)
+      if(z[k,sum(V1)]==0) return(NA)
+      if(z[k,sum(V1)]==1 &  z[k,order(V1) == order(V2)][1]) return(NA)
+      if(z[k,sum(V1)]==1 &  (z[k[1],V2]==z[k[2],V2])) return(NA) #This does not have to be NA
+      
+      x <- cbind(
+        z[k],
+        V3=as.numeric(y[which(apply(is.na(y[,k+1,with=F]),1,any))[1]-1,k+1,with=F])
+        )
+      
+      if(x[1,V3]==x[2,V3]) return("Tied")
+      return(ifelse(x[,order(V2)==order(V3)][1],"Disagree","Agree"))
+    })
+  }))))
+  return((conc$Agree + .5*conc$Tied) / sum(unlist(conc)))
+}
+```
+
+```{r}
+construct.survival.data <- function(detect){
+    
+  x <- detect$RECIST$EMMA[RECIST=="PD",head(.SD,1),patient.ID]
+  x <- rbind(x,detect$RECIST$EMMA[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+  x <- x[,.(patient.ID,event.date=as.Date(date,"%d/%m/%Y"),RECIST)]
+  x <- x[!is.na(RECIST)]
+  
+  y <- merge(detect$NGTAS.meta,
+             detect$NGTAS[Func.refGene=="exonic", .(
+                med.VAF=median(VAF),
+                max.VAF=max(VAF),
+                mean.VAF=mean(VAF),
+                n.VAF=.N
+               ),.(SampleID,Pool)],
+             all.x=T,by=c("SampleID","Pool"))
+  y[is.na(Date.collected),Date.collected:=0]
+  y[is.na(y)] <- 0
+  
+  y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)][order(Patient.ID,Sample.num)]
+  y[,Date.collected.end:=c(tail(Date.collected,-1),NA),Patient.ID]
+  
+  x <- merge(x,y,by.x="patient.ID",by.y="Patient.ID")
+  
+  x <- x[,.(
+    start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+    end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+    event.date=floor(difftime(event.date,min(Date.collected),units="days")),
+    med.VAF,max.VAF,mean.VAF,n.VAF,RECIST),
+    patient.ID]
+  
+  # Add genotype
+  x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+  
+  # Remove patients that progress before plasma samples
+  x <- x[event.date>0]
+  
+  # Remove samples taken after PD
+  x <- x[event.date>start]
+  
+  # Set final sample to "finish" on final scan (if na)
+  x[is.na(end),end:=event.date]
+  
+  # Set events
+  x[,event:=0]
+  x[(event.date>start & event.date <= end) & RECIST == "PD", event:=1]
+  
+  #If final ctDNA sample extends past a PD call, set end to event.date
+  x[event.date<end & event==1,end:=event.date]
+  
+  return(x)
+}
+```
+
+
+## Measures as individual predictors
+
+```{r}
+x <- construct.survival.data(detect)
+ 
+# Construct models
+models <- list()
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(med.VAF))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(max.VAF))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(mean.VAF))]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ scale(n.VAF))]
+names(models) <- c("med.VAF","max.VAF","mean.VAF","n.VAF")
+
+# Model selection
+coefs <- rbindlist(lapply(models, function(m) data.table(coef(summary(m)))))
+coefs$model <- names(models)
+coefs$p.adj <- p.adjust(unlist(coefs[,5]), method = "hommel")
+#coefs$conc <- sapply(models, function(m) time.dependent.conc(m, x, "patient.ID"))
+coefs$aic <- sapply(models,function(m) AIC(m))
+coefs <- coefs[,c(6,(1:ncol(coefs))[-6]),with=F]
+coefs[order(aic)]
+
+#ggplot(coefs) + aes(x=model,y=conc) + geom_point(size=3) + coord_flip() + labs(x="",y="Concordance") + theme_tufte(20)
+```
+
+## Combined model
+
+```{r}
+m.combined <- x[,coxph(Surv(start,end,event) ~ scale(mean.VAF) + scale(med.VAF) + scale(max.VAF) + scale(n.VAF))]
+summary(m.combined)
+```
+
+```{r}
+y <- as.data.table(coef(m.combined),keep.rownames="model")
+names(y) <- c("model","coef.combined")
+y$model <- sapply(y$model, function(z) substr(z,7,nchar(z)-1))
+y <- merge(y,coefs)
+y <- melt(y,id.vars = 1,measure.vars = 2:3)
+ggplot(y) + aes(x=model,y=value,col=variable) + geom_point(size=5) + geom_hline(yintercept=0,linetype=2) + coord_flip() + theme_bw() + labs(y="Coef",x="")
+```
+
+## Stepwise selection to test combined model
+
+```{r,eval=F}
+#DO NOT USE
+m <- x[,coxph(Surv(start,end,event) ~ ichorCNA.default + z.OR + t.Mad + absolute)]
+summary(step(m,direction = "both"))
+```
+
+## Lasso
+
+
+```{r}
+opt1 <- optL1(x[,Surv(start,end,event)],x[,.(mean.VAF,max.VAF,med.VAF,n.VAF)],fold=nrow(x),standardize = T,trace=F)
+opt1$lambda
+pen <- penalized(x[,Surv(start,end,event)],penalized= ~ mean.VAF+max.VAF+med.VAF+n.VAF,data=x,lambda1 = 1,standardize = T,steps = 100,trace=F)
+plotpath(pen)
+fit <- pen[[length(pen)]]
+coef(fit,"all")
+```
+
+## Dimensionally reduced (via pca) model
+
+```{r}
+  y <- merge(detect$NGTAS.meta,
+             detect$NGTAS[Func.refGene=="exonic" & snp138==".",.(
+                med.VAF=median(VAF),
+                max.VAF=max(VAF),
+                mean.VAF=mean(VAF),
+                n.VAF=.N
+               ),SampleID],
+             all.x=T,by="SampleID")
+y[is.na(Date.collected),Date.collected:=0]
+y[is.na(y)] <- 0
+
+dr <- prcomp(y[,.(med.VAF,max.VAF,mean.VAF,n.VAF)],center = TRUE,scale. = T)
+plot(dr$sdev^2)
+plot(cumsum(dr$sdev^2/sum(dr$sdev^2)))
+ggplot(melt(dr$rotation)) + aes(x=Var1,y=value) + geom_col(width=0.05) + geom_point(size=2) + geom_hline(yintercept = 0,linetype="dashed") + coord_flip() + facet_grid(~Var2) + theme(axis.text.x = element_text(angle=90,hjust=1)) + xlab("") + ylab("")
+```
+
+### Individual PC
+
+```{r,eval}
+x <- detect$RECIST$EMMA[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST$EMMA[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%Y")]
+
+y <- merge(detect$NGTAS.meta,
+             detect$NGTAS[Func.refGene=="exonic" & snp138==".",.(
+                med.VAF=median(VAF),
+                max.VAF=max(VAF),
+                mean.VAF=mean(VAF),
+                n.VAF=.N
+               ),SampleID],
+             all.x=T,by="SampleID")
+y[is.na(Date.collected),Date.collected:=0]
+y[is.na(y)] <- 0
+
+y <- cbind(y,dr$x)
+y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)][order(Patient.ID,Sample.num)]
+y[,Date.collected.end:=c(tail(Date.collected,-1),NA),.(Patient.ID)]
+
+x <- merge(x,y,by.x="patient.ID",by.y="Patient.ID")
+
+x <- x[,.(
+  start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+  end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+  event.date=floor(difftime(date,min(Date.collected),units="days")),
+  PC1,PC2,PC3,PC4,RECIST),patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set final sample to "finish" on final scan (if na)
+x[is.na(end),end:=event.date]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+models <- list(
+  x[,coxph(Surv(start,end,event) ~ PC1)],
+  x[,coxph(Surv(start,end,event) ~ PC2)],
+  x[,coxph(Surv(start,end,event) ~ PC3)],
+  x[,coxph(Surv(start,end,event) ~ PC4)]
+)
+coefs <- rbindlist(lapply(models, function(m) data.table(coef(summary(m)))))
+coefs$PC <- 1:length(models)
+coefs$p.adj <- p.adjust(unlist(coefs[,5]), method = "hommel")
+#coefs$conc <- sapply(models, time.dependent.conc, x, "patient.ID")
+coefs$AIC <- sapply(models,AIC)
+coefs[order(AIC)]
+```
+
+### Lasso
+
+```{R}
+opt1 <- optL1(x[,Surv(start,end,event)],x[,.(PC1,PC2,PC3,PC4)],fold=nrow(x),standardize = F,trace = F)
+opt1$lambda
+pen <- penalized(x[,Surv(start,end,event)],penalized=~ PC1+PC2+PC3+PC4,data=x,lambda1 = opt1$lambda,standardize = F,steps = 100,trace=F)
+plotpath(pen)
+fit <- pen[[length(pen)]]
+coef(fit)
+m <- x[,coxph(Surv(start,end,event) ~ 
+                offset(coef(fit)[1]*PC1) +
+                offset(coef(fit,"all")[2]*PC2) +
+                offset(coef(fit,"all")[3]*PC3) +
+                offset(coef(fit,"all")[4]*PC4)
+              )]
+survConcordance(x[,Surv(start,end,event)] ~ predict(m))
+```
+
+## Latent factor model
+
+```{r,eval=F}
+library(psych)
+
+x <- detect$RECIST[RECIST=="PD",head(.SD,1),patient.ID]
+x <- rbind(x,detect$RECIST[!(patient.ID %in% x$patient.ID),tail(.SD,1),patient.ID])
+x <- x[,.(patient.ID,date,RECIST)]
+x <- x[!is.na(RECIST)]
+x[,date:=as.Date(date,"%d/%m/%y")]
+
+y <- get.measures(detect)
+y$ichorCNA.best <- NULL
+
+nfact <- fa.parallel(y,fm="ml",fa="fa")$nfact
+
+fa(y,nfactors = 2,rotate = "oblimin",fm="minres")
+
+dr <- prcomp(y,center = TRUE,scale. = T)
+y <- data.table(cbind(detect$sWG.meta,dr$x))
+
+y <- y[Sample.type=="ctDNA" & !is.na(Date.collected)]
+y <-  cbind(
+   y[,head(.SD,-1),.(patient.ID=Patient.ID)],
+   Date.collected.end = y[,.(tail(Date.collected,-1)),.(Patient.ID)][,V1]
+ )
+
+x <- merge(x,y)
+
+x <- x[,.(
+  start=floor(difftime(Date.collected,min(Date.collected),units="days")),
+  end=floor(difftime(Date.collected.end,min(Date.collected),units="days")),
+  event.date=floor(difftime(date,min(Date.collected),units="days")),
+  PC1,PC2,PC3,PC4,PC5,RECIST),patient.ID]
+
+# Add genotype
+x <- merge(x,detect$genotype,by.x="patient.ID",by.y="Patient.ID")
+
+# Remove patients that progress before plasma samples
+x <- x[event.date>0]
+
+# Remove samples taken after PD
+x <- x[event.date>start]
+
+# Set events
+x[,event:=0]
+x[(event.date>start & event.date < end) & RECIST == "PD", event:=1]
+
+
+m <- x[,coxph(Surv(start,end,event) ~ PC1 + PC2 + PC3 + PC4 + PC5)]
+summary(step(m,direction = "both"))
+ggplot(melt(dr$rotation)) + aes(x=Var1,y=value) + geom_col() + facet_wrap(~Var2) + theme(axis.text.x = element_text(angle=90,hjust=1))
+```
+
+
+# Cox Models
+
+## First Sample
+
+```{r}
+x <- merge(detect$NGTAS.meta,
+         detect$NGTAS[Func.refGene=="exonic" & snp138==".",.(
+              med.VAF=median(VAF),
+              max.VAF=max(VAF),
+              mean.VAF=mean(VAF),
+              n.VAF=.N
+             ),SampleID],
+         all.x=T,by="SampleID")
+x[is.na(Date.collected),Date.collected:=0]
+x[is.na(x)] <- 0
+
+ggplot(x[Sample.type=="ctDNA"]) + aes(x=Sample.num==1,y=n.VAF,colour=Sample.num==1) + geom_jitter(width=0.2) +  geom_boxplot(width=0.2,outlier.shape = NA,alpha=0.4)
+ggplot(x[Sample.type=="ctDNA"]) + aes(x=Sample.num==1,y=n.VAF,colour=Sample.num==1) + geom_jitter(width=0.2) +  geom_boxplot(width=0.2,outlier.shape = NA,alpha=0.4)
+```
+
+```{r}
+x <- construct.survival.data(detect)
+x[,event:=ifelse(any(event==1),1,0),patient.ID]
+x <- x[,head(.SD,1),patient.ID]
+x[,score:=n.VAF]
+
+x[,non.zero.tumour.frac:=score!=0]
+fit <- x[,survfit(Surv(event.date,event) ~ non.zero.tumour.frac)]
+ggsurvplot(fit,x,risk.table = T,pval = TRUE,break.time.by=250,risk.table.y.text=F)
+
+x[,non.zero.tumour.frac:=score>16]
+fit <- x[,survfit(Surv(event.date,event) ~ non.zero.tumour.frac)]
+ggsurvplot(fit,x,risk.table = T,pval = TRUE,break.time.by=250,risk.table.y.text=F)
+```
+
+## First + Second Sample
+
+```{r, eval=F}
+#Need to recode if I care --> I don't think this matters
+
+x <- construct.survival.data(detect)
+x <- x[patient.ID %in% x[,.N,patient.ID][N>1,patient.ID]]
+x[,event:=ifelse(any(event==1),1,0),patient.ID]
+x <- x[,head(.SD,2),patient.ID]
+x[,score:=ichorCNA.default]
+
+x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",head(.SD,1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s1=1 - n_est,first.blood=Date.collected)])
+x <- merge(x, detect$ichorCNA.summary[Patient.ID %in% p.subset][Sample.type=="ctDNA",tail(head(.SD,2),1),.(patient.ID=Patient.ID)][,.(patient.ID,tumour.frac.s2=1 - n_est,second.blood=Date.collected)])
+x[,days.till.PD:=round(difftime(as.Date(date,"%d/%m/%y"),second.blood,units="days"))]
+x <- x[days.till.PD>0]
+
+x <- x[!(patient.ID %in% unique(detect$RECIST[RECIST %in% c("SD.brain","PD.brain"),patient.ID]))]
+
+x[,tumour.frac.delta:=tumour.frac.s2-tumour.frac.s1]
+x[,tumour.frac.delta.sign:=tumour.frac.delta>0]
+x[,tumour.frac.s1.above.10:=tumour.frac.s1>.1]
+x[,tumour.frac.s1.nonzero:=tumour.frac.s1!=0]
+
+m <- list(
+    Nth=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2)],
+    Nth.minus=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s1)],
+    Delta=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.delta)],
+    Nth.minus.plus.Delta=x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s1 + tumour.frac.delta)]
+  )
+
+summary(m[[which.min(sapply(m, AIC))]])
+
+AICs <- lapply(m, AIC)
+```
+
+
+```{r,eval=F}
+models <- suppressWarnings(lapply(0:9, function(i){
+  x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2 > i*0.1)]
+}))
+models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2 == 1)]
+models[[length(models)+1]] <- x[,coxph(Surv(days.till.PD,RECIST=="PD") ~ tumour.frac.s2)]
+names(models) <- c(paste0("threshold=",0:10/10),"continuous")
+
+sort(sapply(models, AIC))
+best.model <- models[[which.min(lapply(models, AIC))]]
+summary(best.model)
+
+new.dat <- data.table(tumour.frac.s2=(0:5)/5)
+fit <- survfit(best.model, newdata = new.dat)
+ggsurvplot(fit, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat )
+```
+
+
+
+# Andersen-Gill model
+
+## First replase
+```{r}
+x <-  construct.survival.data(detect)
+x[,tumour.frac:=n.VAF]
+
+# Construct models with extra vars
+thresholds <- 0:49 * 1
+models <- suppressWarnings(lapply(thresholds, function(thr){
+  x[,coxph(Surv(start,end,event) ~ ER.status + Brain.Tumour + (tumour.frac > thr))]
+}))
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ER.status + Brain.Tumour + tumour.frac)]
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~ ER.status + Brain.Tumour)]
+
+# Construct models without extra vars
+models <- c(models,suppressWarnings(lapply(thresholds, function(thr){
+  x[,coxph(Surv(start,end,event) ~ (tumour.frac > thr))]
+})))
+models[[length(models)+1]] <- x[,coxph(Surv(start,end,event) ~  tumour.frac)]
+
+names(models) <- c(paste0("ER.Brain.",c(paste0("threshold.",thresholds),"continuous","No.Tumour")),c(paste0("threshold.",thresholds),"continuous"))
+
+# Model selection
+AICs <- sapply(models, AIC)
+AICs.sorted <- as.data.table(sort(AICs),keep.rownames = T)
+AICs.sorted[,prob:=exp((V2[1]-V2)/2)]
+AICs.sorted[prob>0.01]
+
+fit <- models[[which.min(AICs)]]
+print(summary(fit))
+# Predictions
+if ("ER.statusPositive" %in% names(models[[which.min(AICs)]]$coefficients)){
+  new.dat <- data.table(tumour.frac=(0:5)/5,ER.status="Positive")
+  pred <- survfit(fit, newdata = new.dat)
+  g1 <- ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat,title="ER+")
+  
+  new.dat <- data.table(tumour.frac=(0:5)/5,ER.status="Negative")
+  pred <- survfit(fit, newdata = new.dat)
+  g2 <- ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=(0:5)/5, data = new.dat,title="ER-")
+  
+  arrange_ggsurvplots(list(g1,g2),print = TRUE, ncol = 2, nrow = 1)
+} else {
+  new.dat <- data.table(tumour.frac=(0:5)/10)
+  pred <- survfit(fit, newdata = new.dat)
+  ggsurvplot(pred, conf.int = T,ggtheme = theme_minimal(),legend.labs=new.dat$tumour.frac,data=new.dat)
+}
+```
+
+```{r}
+x[,unique(event.date),patient.ID][,median(V1)]
+x[ichorCNA.default>0.06,head(.SD,1),patient.ID][,median(event.date-start)]
+pred$time[apply(pred$surv,2, function(x) which(diff(x<0.5)==1))+1]
+pred$surv[which(pred$time==363),]
+```
+
+```{r}
+new.dat <- data.table(tumour.frac=(0:1)/10)
+pred <- survfit(fit, newdata = new.dat)
+ggsurvplot(pred, conf.int = F,ggtheme = theme_tufte(20),legend.labs=c("<7%","\u22657%"),data=new.dat)$plot + scale_x_continuous(breaks=seq(0,365,60)) + xlim(0,365) + labs(x="Days",y="Progression Free\nSurvival Probability") + scale_color_discrete(name="ichorCNA.TF")
+```
+
+
+```{R}
+models <- list(
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="hinge"),
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="step"),
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="segmented"),
+  chngptm(formula.1=Surv(start,end,event)~1, formula.2=~tumour.frac, data=x, family="coxph",type="stegmented")
+)
+sapply(models, function(m) AIC(m$best.fit))
+```
+
+
+```{r}
+m <- x[,coxph(Surv(start,end,event) ~  pspline(tumour.frac,df=0))]
+AIC(m)
+termplot(m, se=TRUE, col.term=1, col.se=1)
+new.dat <- data.table(tumour.frac=(0:5)/10)
+pred <- survfit(m, newdata = new.dat)
+ggsurvplot(pred, conf.int = FALSE,ggtheme = theme_minimal(),legend.labs=new.dat$tumour.frac,data=new.dat)
+```
+
+```{r}
+models <- lapply(0:99, function(i){
+  chngptm(formula.1=Surv(start,end,event)~(tumour.frac>(i*0.01)), formula.2=~tumour.frac, data=x, family="coxph",type="step")
+})
+AICs <- rbindlist(lapply(0:99, function(i)
+  list(
+    chngpt.1=i*0.01,
+    chngpt.2=models[[i+1]]$chngpt,
+    AIC=AIC(models[[i+1]]$best.fit)
+  )
+))
+AICs[order(AIC)][1:10]
+```
+
+
+## Multiple relapses
+
+```{r,eval=F}
+detect$RECIST[scan.id!="B",abs(diff(as.numeric(factor(RECIST=="PD")))),patient.ID][,ceiling(sum(V1)/2),patient.ID][V1>1]
+```
+
+# Treament Boundries
+
+```{r}
+get.treat.bound <- function(detect){
+  x <- detect$treatment[start.date!=end.date]
+  pre <- x[,head(.SD,-1),patient.ID]
+  post <- x[,tail(.SD,-1),patient.ID]
+  
+  names(pre) <- paste0("pre.",names(pre))
+  names(post) <- paste0("post.",names(post))
+  
+  x <- cbind(pre,post)
+  x <- x[,.(patient.id=pre.patient.ID,pre.treatment,post.treatment,
+            pre.start.date=pre.start.date,
+            change.date=pre.end.date,
+            post.end.date=post.end.date)]
+  x[is.na(post.end.date),post.end.date:=Sys.Date()]
+  
+  x <- rbindlist(lapply(1:nrow(x),function(i){
+    tb <- x[i]
+    
+    pre.score <- merge(
+      detect$sWG.meta[Sample.type=="ctDNA"][Patient.ID==tb$patient.id & (as.Date(Date.collected) > tb$pre.start.date & as.Date(Date.collected) < tb$change.date)][order(as.Date(Date.collected))][.N],
+      detect$ichorCNA.summary.default
+      )[,.(pre.score.date=as.Date(Date.collected)-tb$change.date,pre.score=1-n_est)][1]
+    
+    post.score <- merge(
+      detect$sWG.meta[Sample.type=="ctDNA"][Patient.ID==tb$patient.id & (as.Date(Date.collected) < tb$post.end.date & as.Date(Date.collected) > tb$change.date)][order(as.Date(Date.collected))][1],
+      detect$ichorCNA.summary.default
+      )[,.(post.score.date=as.Date(Date.collected)-tb$change.date,post.score=1-n_est)][1]
+    
+    pre.CT <- detect$RECIST$EMMA[patient.ID==tb$patient.id & (as.Date(date,"%d/%m/%Y") > tb$pre.start.date & as.Date(date,"%d/%m/%Y") < tb$change.date)][order(as.Date(date,"%d/%m/%Y"))][.N][,.(pre.CT.date=as.Date(date,"%d/%m/%Y")-tb$change.date,pre.CT=RECIST)][1]
+    
+    post.CT <- detect$RECIST$EMMA[patient.ID==tb$patient.id & (as.Date(date,"%d/%m/%Y") < tb$post.end.date & as.Date(date,"%d/%m/%Y") > tb$change.date)][order(as.Date(date,"%d/%m/%Y"))][.N][,.(post.CT.date=as.Date(date,"%d/%m/%Y")-tb$change.date,post.CT=RECIST)][1]
+    
+    y <- list(tb,pre.score,post.score,pre.CT,post.CT)
+    return(do.call("cbind",y))
+  }))
+  return(x)
+}
+```
+
+
+```{r,eval=F}
+treat.bound <- get.treat.bound(detect)
+time.dist <- data.table(melt(treat.bound,id.vars = 1:2,measure.vars = c(3,5,7,9)))
+ggplot(time.dist) + aes(x=abs(as.numeric(value))/28) + geom_step(aes(y=..y..),stat="ecdf") + facet_wrap(~variable) + xlab("Months")
+```
+
+## Logistic model (6m time limit)
+
+### continuous
+
+```{r}
+time.limit <- 6 * 28
+
+treat.bound <- get.treat.bound(detect)
+treat.bound <- treat.bound[rowSums(is.na(treat.bound))==0]
+treat.bound <- treat.bound[rowSums(treat.bound[,grep("(CT|score).date",names(treat.bound)),with=F][,lapply(.SD,abs)] > time.limit) == 0]
+nrow(treat.bound)
+
+treat.bound[,pre.CT:=factor(ifelse(pre.CT=="PD","PD","!PD"))]
+treat.bound[,post.CT:=factor(ifelse(post.CT=="PD","PD","!PD"))]
+treat.bound[,dif.score:=post.score-pre.score]
+
+models <- list(
+  dif.score = treat.bound[,glm(post.CT ~ pre.CT + dif.score, family = binomial)],
+  tumour.post = treat.bound[,glm(post.CT ~ pre.CT + post.score, family = binomial)],
+  tumour.pre = treat.bound[,glm(post.CT ~ pre.CT + pre.score, family = binomial)],
+  tumour.all = treat.bound[,glm(post.CT ~ pre.CT + pre.score + post.score, family = binomial)]
+)
+sapply(models,AIC)
+best.model <- models[[which.min(sapply(models,AIC))]]
+
+m.tmp <- glm(as.formula(gsub("pre.CT \\+","",paste(as.character(best.model$formula)[c(2,1,3)],collapse = " "))),
+  family = binomial,
+  data=treat.bound)
+if(AIC(m.tmp) < AIC(best.model)) best.model <- m.tmp
+summary(best.model)
+```
+
+#### Expanded dataset
+
+```{R}
+time.limit <- 6 * 28
+m.terms <- c("post.CT","pre.CT","post.score")
+m.terms <- c(m.terms, paste0(m.terms,".date"))
+
+treat.bound <- get.treat.bound(detect)
+treat.bound[,pre.CT:=factor(ifelse(pre.CT=="PD","PD","!PD"))]
+treat.bound[,post.CT:=factor(ifelse(post.CT=="PD","PD","!PD"))]
+treat.bound[,dif.score:=post.score-pre.score]
+
+treat.bound <- treat.bound[,names(treat.bound) %in% m.terms,with=F]
+treat.bound <- treat.bound[rowSums(is.na(treat.bound))==0]
+treat.bound <- treat.bound[rowSums(treat.bound[,grep("(CT|score).date",names(treat.bound)),with=F][,lapply(.SD,abs)] > time.limit) == 0]
+nrow(treat.bound)
+
+summary((m <- treat.bound[,glm(post.CT ~ pre.CT + post.score,family = binomial)]))
+
+pred <- predict(m, type = 'response')
+pred <- prediction(pred,treat.bound$post.CT)
+plot(performance(pred, measure = "tpr", x.measure = "fpr"))
+abline(a=0,b=1)
+performance(pred, measure = "auc")@y.values[[1]]
+
+acc <- performance(pred, "acc")
+i <- which.max(acc@y.values[[1]])
+c(acc@x.values[[1]][i],acc@y.values[[1]][i])
+(logit(acc@x.values[[1]][i])  - coef(m)[1]) / coef(m)[3]
+```
+
+
+### Thresholds
+
+```{r}
+time.limit <- 6 * 28
+thresh <- 0.06
+  
+treat.bound <- get.treat.bound(detect)
+treat.bound <- treat.bound[rowSums(is.na(treat.bound))==0]
+treat.bound <- treat.bound[rowSums(treat.bound[,grep("(CT|score).date",names(treat.bound)),with=F][,lapply(.SD,abs)] > time.limit) == 0]
+nrow(treat.bound)
+
+treat.bound[,pre.CT:=factor(ifelse(pre.CT=="PD","PD","!PD"))]
+treat.bound[,post.CT:=factor(ifelse(post.CT=="PD","PD","!PD"))]
+treat.bound[,dif.score:=post.score-pre.score]
+
+models <- list(
+  tumour.post = treat.bound[,glm(post.CT ~ pre.CT + (post.score > thresh), family = binomial)],
+  tumour.pre = treat.bound[,glm(post.CT ~ pre.CT + (pre.score > thresh), family = binomial)],
+  tumour.all = treat.bound[,glm(post.CT ~ pre.CT + (pre.score > thresh) + (post.score > thresh), family = binomial)]
+)
+sapply(models,AIC)
+best.model <- models[[which.min(sapply(models,AIC))]]
+
+m.tmp <- glm(as.formula(gsub("pre.CT \\+","",paste(as.character(best.model$formula)[c(2,1,3)],collapse = " "))),
+  family = binomial,
+  data=treat.bound)
+if(AIC(m.tmp) < AIC(best.model)) best.model <- m.tmp
+summary(best.model)
+```
+
+#### Expanded dataset
+
+```{R}
+time.limit <- 6 * 28
+thresh <- 0.06
+m.terms <- c("pre.CT","post.CT","post.score")
+m.terms <- c(m.terms, paste0(m.terms,".date"))
+
+treat.bound <- get.treat.bound(detect)
+treat.bound[,pre.CT:=factor(ifelse(pre.CT=="PD","PD","!PD"))]
+treat.bound[,post.CT:=factor(ifelse(post.CT=="PD","PD","!PD"))]
+treat.bound[,dif.score:=post.score-pre.score]
+
+treat.bound <- treat.bound[,names(treat.bound) %in% m.terms,with=F]
+treat.bound <- treat.bound[rowSums(is.na(treat.bound))==0]
+treat.bound <- treat.bound[rowSums(treat.bound[,grep("(CT|score).date",names(treat.bound)),with=F][,lapply(.SD,abs)] > time.limit) == 0]
+nrow(treat.bound)
+
+summary((m <- glm(best.model$formula,family = binomial,data=treat.bound)))
+
+pred <- predict(m, type = 'response')
+pred <- prediction(pred,treat.bound$post.CT)
+performance(pred, measure = "auc")@y.values
+max(unlist(performance(pred, "acc")@y.values))
+```
+
+
+
+## Ordinal Logistic
+
+### 6m time limit
+
+```{r,eval=F}
+time.limit <- 6 * 28
+
+treat.bound <- get.treat.bound()
+treat.bound <- treat.bound[rowSums(is.na(treat.bound))==0]
+treat.bound <- treat.bound[rowSums(treat.bound[,grep("(CT|score).date",names(treat.bound)),with=F][,lapply(.SD,abs)] > time.limit) == 0]
+nrow(treat.bound)
+
+models <- list(
+  dif.score = treat.bound[,polr(post.CT ~ pre.CT + dif.score, Hess = T)],
+  tumour.post = treat.bound[,polr(post.CT ~ pre.CT + post.score, Hess = T)],
+  tumour.pre = treat.bound[,polr(post.CT ~ pre.CT +pre.score, Hess = T)],
+  tumour.all = treat.bound[,polr(post.CT ~ pre.CT +pre.score + post.score, Hess = T)]
+)
+sapply(models,AIC)
+m <- models[[which.min(sapply(models,AIC))]]
+summary(m)
+
+ctable <- coef(summary(m))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+(ctable <- cbind(ctable, "p value" = p))
+(ci <- confint(m))
+exp(cbind(OR = coef(m), ci))
+```
+
+```{r,eval=F}
+newdat <- data.table(
+  pre.CT = rep(c("CR","PR","SD","PD"),each=101),
+  post.score = rep(0:100/100, 4))
+newdat <- cbind(newdat, predict(m, newdat, type = "probs"))
+newdat <- melt(newdat,id.vars = 1:2,variable.name = "post.CT",value.name = "Probability")
+newdat$pre.CT <- factor(newdat$pre.CT,levels = c("CR","PR","SD","PD"))
+ggplot(newdat) + aes(x = post.score, y = Probability, colour = post.CT) + geom_line() + facet_wrap(~ pre.CT,labeller="label_both") + scale_colour_brewer(palette = "Spectral",direction = -1) + theme_bw()
+```

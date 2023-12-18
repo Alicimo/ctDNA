@@ -1,0 +1,80 @@
+---
+title: "Measuring tumour dynamics via sWG sequencing of ctDNA - segments"
+author: "Alistair Martin"
+date: "7 July 2017"
+output: html_notebook
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(ggplot2)
+library(ggthemes)
+theme_set(theme_bw())
+
+theme_sWG <- theme_tufte() + theme(
+  axis.ticks.x=element_blank(),
+  axis.text.x=element_blank(),
+  axis.ticks.y=element_blank(),
+  axis.text.y=element_blank(),
+  panel.spacing.x=unit(0, "lines"),
+  panel.border=element_rect(color="grey80",fill=NA,size=1,linetype="solid"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  strip.text.y = element_text(size=6),
+  plot.title = element_text(hjust = 0.5)
+  )
+
+source("src/load.sWG.R")
+data <- load.sWG.data()
+data$cns <- cbind(data$cns[,1:4,with=F],apply(data$cns[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+data$segments <- cbind(data$segments[,1:4,with=F],apply(data$segments[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+
+i <- data$meta[,which(type=="BC")]
+z.segs <- list()
+for(j in 1:nrow(data$meta)){
+  x <- data$segments[,c(2:4,j+4),with=F]
+  names(x) <- c("Chromosome","Start","End","Segment_Mean")
+  x$grp <- x[,c(1,which(diff(Segment_Mean)!=0)+1,.N+1),Chromosome][,rep(1:length(diff(V1)), diff(V1)),Chromosome][,V1]
+  x <- x[,.(Start=min(Start),End=max(End),.N),.(Chromosome,grp)][,-c('grp')]
+  x$z.score <- apply(x,1,function(seg){
+    seg <- as.list(seg)
+    k <- data$cns[,which(chromosome == seg$Chromosome & start >= as.numeric(seg$Start)  & end <= as.numeric(seg$End))]
+    y  <- colSums(data$cns[k,-(1:4),with=F])
+    s <- sd(y[i],na.rm=T)
+    u  <- mean(y[i],na.rm=T)
+    z <- (y[j]-u)/s
+    z
+  })
+  x$Sample.name <- data$meta[j,Sample.name]
+  z.segs[[j]] <- x
+}
+```
+
+```{r}
+z.score.threshold <- 3.09 #0.001
+for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient == pat & type=="plasma" & !is.na(cycle))]
+  i <- i[ data$meta[i,order(total.days)] ]
+  
+  j <- data$meta[,which(patient == pat & type=="FFPE" & prior.post=="primary")]
+  i <- c(j,i)
+  
+  x <- rbindlist(z.segs[i])
+  x <- x[!is.na(z.score)]
+  x[,status:=ifelse(z.score>z.score.threshold,"gain",ifelse(z.score< -z.score.threshold,"loss","no.change"))]
+  x[,Chromosome:=factor(Chromosome,levels=c(as.character(1:22),"X","Y"))]
+  x[,Sample.name:=factor(Sample.name,levels=unique(Sample.name))]
+  
+  p <- ggplot(x) + 
+    aes(xmin=Start,xmax=End,ymin=0,ymax=1,fill=status) + 
+    geom_rect() +
+    facet_grid(Sample.name~Chromosome,scales = "free_x",space="free_x") +
+    theme_sWG + 
+    xlab("Chromosome") + 
+    ylab("CNA") +
+    ggtitle(paste("Patient:",pat)) + 
+    scale_fill_manual(values=c("palevioletred","lightskyblue","white"),breaks=c("gain","loss","no.change"),drop=F)
+  print(p)
+}
+```

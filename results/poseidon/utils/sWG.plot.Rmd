@@ -1,0 +1,78 @@
+---
+title: "ctDNA-sWG Plots"
+output: html_notebook
+---
+
+```{r,warnings=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggthemes)
+source("src/load.sWG.R")
+data <- load.sWG.data()
+```
+
+#sWG plotting style
+```{r}
+theme_sWG <- theme_tufte() + theme(
+  axis.ticks.x=element_blank(),
+  axis.text.x=element_blank(),
+  panel.spacing.x=unit(0, "lines"),
+  panel.border=element_rect(color="grey80",fill=NA,size=1,linetype="solid"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  strip.text.y = element_text(size=6),
+  plot.title = element_text(hjust = 0.5)
+  )
+
+sWG.plot <- function(x){
+  p <- ggplot(x) +
+    scale_y_continuous(limits=c(-2,2)) + 
+    labs(x="Chromosome",y=expression(Log[2]~Ratio)) +
+    theme_sWG
+}
+``` 
+
+#Plots for each patient with all times
+```{r,warnings=FALSE}
+if(!dir.exists('figures/sWG.patients')){dir.create('figures/sWG.patients')}
+for(pat in data$meta[,sort(unique(patient))]){
+  x <- data.table()
+  for(i in data$meta[,which(patient==pat)]){
+    j <- i + 4
+    stopifnot( data$meta[i,fname]==names(data$cns)[j] )
+    y <- data$cns[,1:4]
+    y[,total.days:=data$meta[i,total.days]]
+    y[,Sample.name:=data$meta[i,Sample.name]]
+    y[,cns:=data$cns[,j,with=FALSE]]
+    y[,segments:=data$segments[,j,with=FALSE]]
+    y$grp <- y[,c(1,which(diff(segments)!=0)+1,.N+1),chromosome][,rep(1:length(diff(V1)), diff(V1)),chromosome][,V1]
+    x <- rbind(x,y)
+  }
+  x[,chromosome:=factor(chromosome,levels=c(1:22,'X'))]
+  x[,total.days:=total.days+0.01*(as.numeric(factor(Sample.name))-1),total.days]
+  x[,total.days:=factor(total.days)]
+  levels(x$total.days) <- x[,unique(Sample.name)[1],total.days][order(total.days),V1]
+  
+  p <- sWG.plot(x) +
+    geom_point(aes(x=start,y=cns),size=0.1,alpha=0.1,colour='grey40') +
+    geom_hline(yintercept = 0,linetype='dashed',colour='grey80') +
+    geom_line(aes(x=start,y=segments,group=interaction(Sample.name,grp),colour=cut(segments,c(-10000,-0.1,0.1,10000)))) +
+    facet_grid(total.days~chromosome,scales="free_x",space="free_x",switch="x") +
+    ggtitle(paste("Patient:",pat))
+  
+  if(nrow(x[segments>(2)])>0){
+    p <- p + geom_text(data=x[segments>(2)][,.(start=as.double(median(start))),.(total.days,chromosome,grp)],aes(x=start,y=(1.7),label='*',size=10,colour=cut(2,c(-10000,-0.1,0.1,10000))))
+  }
+  if(nrow(x[segments<(-2)])>0){
+    p <- p + geom_text(data=x[segments<(-2)][,.(start=as.double(median(start))),.(total.days,chromosome,grp)],aes(x=start,y=(-2),label='*',size=10,colour=cut(-2,c(-10000,-0.1,0.1,10000))))
+  }
+  
+  p <- p + scale_colour_manual(values=c("deepskyblue2","Black","palevioletred2")) + theme(legend.position="none")
+  
+  w <- length(data$meta[,which(patient==pat)])
+  ggsave(paste0("figures/sWG.patients/patient.",pat,'.png'),plot=p,width=12,height=2+w)
+  #print(p,width=12,height=2+w)
+
+}
+```

@@ -1,0 +1,111 @@
+---
+title: 'ctDNA: ichorCNA'
+author: "Alistair Martin"
+date: '`r format(Sys.time(), "Last modified: %d %b %Y")`'
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+  html_notebook:
+    toc: yes
+    toc_float: yes
+layout: page
+---
+
+```{r 'setup', message=FALSE, warning=FALSE}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+
+suppressWarnings(library(data.table))
+library(ggplot2)
+library(ggthemes)
+library(knitr)
+library(ichorCNA)
+library(parallel)
+source(paste0(project.dir,"src/load.detect.R"))
+
+data <- detect.load(project.dir)
+
+i <- which(data$sWG.meta[,Sample.type %in% c("ctDNA","BC")] & !duplicated(data$sWG.meta[,.(Sample.type,Patient.ID,Sample.num)]))
+data$sWG.meta <- data$sWG.meta[i]
+data$sWG$cns <- data$sWG$cns[,c(1:4,i+4),with=F]
+data$sWG$segments <- data$sWG$segments[,c(1:4,i+4),with=F]
+```
+
+```{r}
+normalise.ichorRNA <- function(data,indNorm){
+    meds <- apply(data$cns[,indNorm+4,with=F],1,function(x){median(x,na.rm=T)})
+    data$cns <- cbind(data$cns[,1:4],data$cns[,.SD[,-(1:4)]] - meds)
+    return(data)
+}
+
+run.ichorCNA <- function(data.normed,ind,env.vars){
+  list2env(env.vars,envir = environment())
+  results <- list()
+  tumour_copy <- list()
+  tumour_copy[["WTF"]] <- RangedData(makeGRangesFromDataFrame(data.normed$cns[,c(2:4,ind+4),with=F],keep.extra.columns = T))
+  colnames(tumour_copy[[1]])[2] <- "copy"
+  tumour_copy[[1]]$valid <- TRUE
+  chrInd <- space(tumour_copy[[1]]) %in% chrTrain
+  valid <- tumour_copy[[1]]$valid
+
+  loglik <- as.data.frame(matrix(NA, nrow = length(normal) * length(ploidy), ncol = 7, 
+                               dimnames = list(c(), c("init", "n_est", "phi_est", "Subclone_Frac", 
+                                                      "Frac_genome_subclonal", "Frac_CNA_subclonal", "loglik"))))
+  logR <- as.data.frame(lapply(tumour_copy, "[[", "copy"))
+  
+  counter <- 1
+  for(n in normal){
+    for(p in ploidy){
+      
+      param <<- getDefaultParameters(logR[chrInd, , drop=F], ploidy = floor(p), ct.sc=scStates)
+      logR.var <- 1 / ((apply(logR, 2, sd, na.rm = TRUE) / sqrt(length(param$ct))) ^ 2)
+      param$lambda <- rep(logR.var, length(param$ct))
+      param$lambda[param$ct %in% c(2)] <- logR.var 
+      param$lambda[param$ct %in% c(1,3)] <- logR.var 
+      param$lambda[param$ct >= 4] <- logR.var / 5
+      param$lambda[param$ct == max(param$ct)] <- logR.var / 15
+      param$lambda[param$ct.sc.status] <- logR.var / 10
+      param$alphaLambda <- rep(lambdaScaleHyperParam, length(param$ct))
+      param$phi_0 <- p
+      param$n_0 <- n
+
+      hmmResults.cor <- ichorCNA::HMMsegment(tumour_copy, dataType = "copy", param = param, validInd = valid, 
+                                   estimateNormal = T, estimatePloidy = T, estimateSubclone = T, verbose = F)
+  
+      iter <- hmmResults.cor$results$iter
+      results[[counter]] <- hmmResults.cor
+      loglik[counter, "loglik"] <- signif(hmmResults.cor$results$loglik[iter], digits = 4)
+      subClonalBinCount <- unlist(lapply(hmmResults.cor$cna, function(x){ sum(x$subclone.status - 1) }))
+      fracGenomeSub <- subClonalBinCount / unlist(lapply(hmmResults.cor$cna, function(x){ nrow(x) }))
+      fracAltSub <- subClonalBinCount / unlist(lapply(hmmResults.cor$cna, function(x){ sum(x$copy.number != 2) }))
+      fracAltSub <- lapply(fracAltSub, function(x){if (is.na(x)){0}else{x}})
+      loglik[counter, "Frac_genome_subclonal"] <- paste0(signif(fracGenomeSub, digits=2), collapse=",")
+      loglik[counter, "Frac_CNA_subclonal"] <- paste0(signif(as.numeric(fracAltSub), digits=2), collapse=",")
+      loglik[counter, "init"] <- paste0("n", n, "-p", p)
+      loglik[counter, "n_est"] <- paste(signif(hmmResults.cor$results$n[, iter], digits = 2), collapse = ",")
+      loglik[counter, "phi_est"] <- paste(signif(hmmResults.cor$results$phi[, iter], digits = 4), collapse = ",")
+      loglik[counter, "Subclone_Frac"] <- paste(signif(hmmResults.cor$results$sp[, iter], digits = 4), collapse = ",")
+      counter <- counter + 1
+    }
+  }
+  i <- order(as.numeric(loglik[, "loglik"]), decreasing = T)
+  list(LLs=loglik[i,],models=results[i])
+}
+```
+
+```{r}
+env.vars <- list(
+  normal = c(0.5,0.6,0.7,0.8,0.9),
+  ploidy = c(2,3),
+  scStates = c(1,3),
+  chrTrain = c(1:22),
+  minSegmentBins = 50,
+  altFracThreshold = 0.05,
+  estimateScPrevalence = TRUE,
+  lambdaScaleHyperParam = 3
+)
+data.normed <- normalise.ichorRNA(data,data$meta[,which(type=="BC")])
+
+x <- mclapply(1:4, function(i) run.ichorCNA(data.normed,i,env.vars))
+```

@@ -1,0 +1,58 @@
+---
+title: "Measuring tumour dynamics via sWG sequencing of ctDNA"
+author: "Alistair Martin"
+date: "7 July 2017"
+output: html_notebook
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(ggplot2)
+library(ggthemes)
+library(pheatmap)
+theme_set(theme_bw())
+
+source("src/load.sWG.R")
+data <- load.sWG.data()
+data$cns <- cbind(data$cns[,1:4,with=F],apply(data$cns[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+data$segments <- cbind(data$segments[,1:4,with=F],apply(data$segments[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+
+absolute <- load.absolute.data()
+RECIST <- load.RECIST.data()
+
+get.measures <- function(){
+  i <- data$meta[,which(type=="BC")]
+  s <- apply(data$cns[,i+4,with=F],1,function(x){sd(x,na.rm=T)})
+  s[which(s==0)] <- NA
+  u  <- rowSums(data$cns[,i+4,with=F]) / length(i)
+
+  x <- list(
+    "z.score"=apply(data$cns[,-(1:4),with=F],2,function(x){by(abs((as.numeric(x)-u)/s),data$cns$chromosome,function(y){sum(y,na.rm=T)})}),
+    "n.seg"=apply(data$segments[,-(1:4),with=F],2,function(x){by(x,data$segments$chromosome,function(y){sum(diff(y)!=0)})})
+  )
+  x
+}
+```
+
+```{r,fig.width=10,fig.height=8}
+y <- get.measures()
+i <- data$meta[,which(type=="plasma" & !is.na(cycle))]
+i <- i[ i != data$meta[,which(Sample.name=="1_C1D1")]]
+
+for(x in y){
+  x <- x[,i]
+  colnames(x) <- data$meta[i,patient]
+  
+  pca <- prcomp(t(x))
+  print(summary(pca))
+  pca <- cbind(data$meta[i],pca$x)
+  print(ggplot(pca) + aes(x=PC1,y=PC2,label=as.factor(patient)) + geom_text(size=5) + theme_tufte(20))
+  
+  ph <- pheatmap(scale(t(x)),cluster_cols = F)
+  print(ph)
+  
+  d <- dist(t(x), method = "euclidean")
+  hc <- hclust(d,method="ward.D")
+  print(cluster.stats(d,cutree(hc,30),colnames(x),compareonly = T))
+}
+```

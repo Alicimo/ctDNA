@@ -1,0 +1,679 @@
+---
+title: Predicting treatment response using shallow whole genome sequencing of cell-free DNA using in patients with metastatic Her2+ve breast cancer.
+author: "Alistair Martin and Emma Beddowes and Mario Ortega Duran and others and Carlos Caldas"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  bookdown::tufte_html2:
+    number_sections: no
+    toc: yes
+  bookdown::word_document2: null
+  bookdown::pdf_document2:
+    keep_tex: yes
+    number_sections: no
+    toc: no
+link-citations: yes
+---
+
+<!-- 
+bibliography: "~/OneDrive/projects/ctDNA/doc/refs.bib"
+    includes:
+      before_body: doc_prefix.tex
+      in_header: preamble.tex
+-->
+
+<!-- Set up, load data and main text analysis -->
+
+```{r 'knitr_options', echo=FALSE}
+library(knitr)
+opts_chunk$set(fig.align='center', cache=F, warning = F, message = T, echo = F)
+options(digits = 3, width = 88)
+```
+
+```{r 'setup', message=FALSE, warning=FALSE}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+
+pkgs <- c("data.table","ggplot2","ggthemes","GGally","ggbio","grid",
+          "GenomicRanges","survival","survminer",
+          "org.Hs.eg.db","TxDb.Hsapiens.UCSC.hg19.knownGene",
+          "ROCR","stargazer","rms") # rms doesn't install
+pkgs <- lapply(pkgs,function(pkg) suppressWarnings(suppressMessages(library(pkg, ch = TRUE))))
+
+source(paste0(project.dir,"src/load.detect.measures.R"))
+source(paste0(project.dir,"src/analysis.funcs.R"))
+
+detect <- detect.load.measures(project.dir)
+detect$ichorCNA.default$bestModels <- process.segs(detect.extract.segs(detect))
+detect$dist.matrix <- get.dist.mat(detect$ichorCNA.default$bestModels$expanded,project.dir,cor.dist,use="pairwise.complete.obs")
+metabric <- get.metabric(root.dir,project.dir,detect)
+results <- list()
+```
+
+```{r 'survival.AG.all.geno'}
+x <- construct.survival.data(detect)
+models <- list()
+
+# Independent models
+models[["ichorCNA.default"]] <- x[,.(start,end,event,ER.Her2,score=scale(ichorCNA.default)[,1])]
+models[["ichorCNA.low"]] <- x[,.(start,end,event,ER.Her2,score=scale(ichorCNA.low)[,1])]
+models[["z.OR"]] <- x[,.(start,end,event,ER.Her2,score=scale(z.OR)[,1])]
+models[["t.MAD"]] <- x[,.(start,end,event,ER.Her2,score=scale(t.Mad)[,1])]
+models[["absolute"]] <- x[,.(start,end,event,ER.Her2,score=scale(absolute)[,1])]
+
+models <- lapply(models, function(x) x[,coxph(Surv(start,end,event) ~ ER.Her2+score)])
+models <- models[order(sapply(models, AIC))]
+
+
+# Combined model
+m.combined <- x[,.(start,end,event,ER.Her2,
+                   ichorCNA.default=scale(ichorCNA.default)[,1],
+                   ichorCNA.low=scale(ichorCNA.low)[,1],
+                   z.OR=scale(z.OR)[,1],
+                   t.Mad=scale(t.Mad)[,1],
+                   absolute=scale(absolute)[,1]
+                   )][,coxph(Surv(start,end,event) ~ ER.Her2 + ichorCNA.default + ichorCNA.low + z.OR + t.Mad + absolute)]
+
+results[['survival.AG.all']] <- list(
+  m.ind = models,
+  m.com = m.combined
+)
+```
+
+```{r 'survival.cox.ichor.cut'}
+x <- construct.survival.data(detect)
+x[,event:=ifelse(any(event==1),1,0),Patient.ID]
+x <- x[,head(.SD,1),Patient.ID]
+x[,score:=ichorCNA.default]
+
+x[,tumour.frac.above.10:=score>=.1]
+x[,non.zero.tumour.frac:=score!=0]
+
+results[["survival.cox.ichor"]] <- list(
+  m.10 = x[,survfit(Surv(event.date,event) ~ tumour.frac.above.10)],
+  m.0 = x[,survfit(Surv(event.date,event) ~ non.zero.tumour.frac)],
+  data = x
+)
+```
+
+```{r 'survival.AG.ichor.cont'}
+x <-  construct.survival.data(detect)
+x[,tumour.frac:=ichorCNA.default]
+m <- x[,cph(Surv(start,end,event) ~  tumour.frac,x=T,y=T,surv=T)]
+m.boot <- validate(m,B=500)
+
+results[["survival.AG.ichor.cont"]] <- list(
+  m = m,
+  m.boot = m.boot
+)
+```
+
+```{r 'survival.AG.ichor.cut'}
+x <- construct.survival.data(detect)
+x[,tumour.frac:=ichorCNA.default]
+
+q <- data.table(t(sapply(x[,unique(Patient.ID)],function(p.ID){
+  y <- x[Patient.ID!=p.ID]
+  thresholds <- seq(0,max(y$tumour.frac)-0.01,0.01)
+  models <- suppressWarnings(lapply(thresholds, function(thr){
+    y[,cph(Surv(start,end,event) ~ (tumour.frac > thr),x=T,y=T,surv=T)]
+  }))
+  LLs <- data.table(thresholds,loglik=sapply(models, function(x) x$loglik[2] ))
+  c(p.ID,LLs[which.max(unlist(loglik)),thresholds])
+})))
+opt.cut <- q[,.N,V2][order(N),V2]
+
+results[['survival.AG.ichor.cut']] <- list(
+  opt.cut = opt.cut,
+  m = x[,cph(Surv(start,end,event) ~ (tumour.frac > opt.cut),x=T,y=T,surv=T)]
+)
+```
+
+```{r 'boundaries.binom.cont'}
+time.limit <- 6 * 28
+m.terms <- c("post.CT","post.score")
+m.terms <- c(m.terms, paste0(m.terms,".date"))
+
+treat.bound <- get.treat.bound.preprocess(detect,20,T,m.terms,time.limit)
+m <- treat.bound[,glm(post.CT ~ post.score,family = binomial)]
+
+pred <- predict(m, type = 'response')
+pred <- prediction(pred,treat.bound$post.CT)
+
+acc <- data.table(
+  cut=performance(pred, "acc")@x.values[[1]],
+  acc=performance(pred, "acc")@y.values[[1]],
+  tpr=performance(pred, "tpr")@y.values[[1]],
+  fpr=performance(pred, "fpr")@y.values[[1]]
+)
+
+results[["boundaries.binom.cont"]] <- list(
+  m = m,
+  acc = acc,
+  auc = performance(pred, measure = "auc")@y.values[[1]]
+)
+```
+
+```{r 'boundaries.binom.cut'}
+time.limit <- 6 * 28
+m.terms <- c("post.CT","post.score")
+m.terms <- c(m.terms, paste0(m.terms,".date"))
+
+treat.bound <- get.treat.bound.preprocess(detect,20,T,m.terms,time.limit)
+
+x <- treat.bound[,.N,.(post.CT,post.score>results$survival.AG.ichor.cut$opt.cut)]
+
+results[["boundaries.binom.cut"]] <- list(
+  data = x,
+  acc = (x[post.CT=="PD" & post.score==T,N] + x[post.CT!="PD" & post.score==F,N]) / x[,sum(N)],
+  tpr = x[post.CT=="PD" & post.score==T,N] / x[post.CT=="PD",sum(N)],
+  fpr = x[post.CT=="!PD" & post.score==T,N] / x[post.CT=="!PD",sum(N)]
+)
+```
+
+```{r 'boundaries.ordinal'}
+time.limit <- 6 * 28
+m.terms <- c("post.CT","post.score")
+m.terms <- c(m.terms, paste0(m.terms,".date"))
+
+treat.bound <- get.treat.bound.preprocess(detect,20,F,m.terms,time.limit)
+treat.bound[,post.CT:=ordered(ifelse(post.CT %in% c("PR","CR","NMD"),"response",ifelse(post.CT =="SD","stable","progressive")),levels=c("progressive","stable","response"))]
+m <- treat.bound[,MASS::polr(post.CT ~ post.score, Hess = T)]
+
+ctable <- coef(summary(m))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+
+results[["boundaries.ordinal.cont"]] <- list(
+  m = m,
+  ctable = cbind(ctable, "p value" = p)
+)
+```
+
+```{r 'distance.within_patient'}
+i <- which(detect$sWG$meta$Sample.type=="ctDNA" & detect$ichorCNA.default$summary$n_est!=1)
+x <- detect$dist.matrix[i,i]
+x[lower.tri(x)] <- NA
+x <- data.table(suppressWarnings(melt(x)))
+x <- x[!is.na(value)]
+x <- x[Var1 != Var2]
+
+x$p.ID.1 <- detect$sWG$meta[match(x$Var1,Sample.name),Patient.ID]
+x$p.ID.2 <- detect$sWG$meta[match(x$Var2,Sample.name),Patient.ID]
+
+results[["cor.within_patient"]] <- list(
+  data = x,
+  ks = ks.test(x[p.ID.1==p.ID.2,value],x[p.ID.1!=p.ID.2,value],alternative = "l")
+)
+```
+
+```{r 'distance.rand_patient.top10'}
+x <- cbind(detect$sWG$meta,detect$ichorCNA.default$summary)
+
+pat.subset <-x[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][N>4,Patient.ID]
+i <- x[,.I[Sample.type=="ctDNA" & n_est!=1 & Patient.ID %in% pat.subset]]
+i <- i[which(colSums(is.na(detect$dist.matrix[i,i])) != length(i))]
+
+dist.matrix.sub <- detect$dist.matrix[i,i]
+meta.sub <- x[i]
+
+j <- as.numeric(factor(meta.sub[,Patient.ID]))
+h <- hclust(as.dist(1-dist.matrix.sub))
+k <- cutree(h,nrow(meta.sub[,.N,Patient.ID]))
+
+results[["distance.rand_patient."]] <- list(
+  h = h,
+  j = j,
+  k = k,
+  adj.rand = fossil::adj.rand.index(j,k)
+)
+```
+
+```{r 'distance.rand_patient.top2'}
+x <- cbind(detect$sWG$meta,detect$ichorCNA.default$summary)
+pat.subset <- x[Sample.type == "ctDNA" & n_est!=1,.N,Patient.ID][order(-N)][1:2,Patient.ID]
+i <- x[,.I[Sample.type=="ctDNA" & n_est!=1 & Patient.ID %in% pat.subset]]
+i <- i[which(colSums(is.na(detect$dist.matrix[i,i])) != length(i))]
+
+dist.matrix.sub <- detect$dist.matrix[i,i]
+meta.sub <- x[i]
+
+j <- as.numeric(factor(meta.sub[,Patient.ID]))
+h <- hclust(as.dist(1-dist.matrix.sub))
+k <- cutree(h,nrow(meta.sub[,.N,Patient.ID]))
+
+results[["distance.rand_patient.top2"]] <- list(
+  h = h,
+  j = j,
+  k = k,
+  adj.rand <- fossil::adj.rand.index(j,k)
+)
+```
+
+```{r distance.n_est, eval=F}
+i <- which(detect$sWG$meta$Sample.type=="ctDNA" & detect$ichorCNA.default$summary$n_est!=1)
+x <- detect$dist.matrix[i,i]
+x[lower.tri(x)] <- NA
+x <- data.table(melt(x))
+x <- x[!is.na(value)]
+x <- x[Var1 != Var2]
+
+x$p.ID.1 <- detect$sWG$meta[match(x$Var1,Sample.name),Patient.ID]
+x$p.ID.2 <- detect$sWG$meta[match(x$Var2,Sample.name),Patient.ID]
+
+x$n_est.1 <- detect$ichorCNA.default$summary[match(x$Var1,Sample.name),n_est]
+x$n_est.2 <- detect$ichorCNA.default$summary[match(x$Var2,Sample.name),n_est]
+
+y <- x[p.ID.1==p.ID.2]
+z <- x[p.ID.1!=p.ID.2,value]
+
+r <- seq(x[,min(c(n_est.1,n_est.2))],1,0.01)
+#r <- seq(0.95,sort(unique(x[,c(n_est.1,n_est.2)]))[1],-0.05)
+
+ks <- lapply(r,function(thr){
+  yy <- y[n_est.1>thr&n_est.2>thr,value]
+  if(length(yy)){
+    return(suppressWarnings(ks.test(yy,z,alternative = "l")))
+  } else {
+    return(NULL)
+  }
+})
+names(ks) <- r
+ks <- ks[!sapply(ks, is.null)]
+ks <- data.table(names(ks),sapply(ks, "[[","p.value"),sapply(ks, "[[","statistic"))
+
+ggplot(ks) + aes(x=factor(V1),y=-log10(V2)) + geom_col() + theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=.5)) + ggtitle("Both below thresh: p.val")
+ggplot(ks) + aes(x=factor(V1),y=V3) + geom_col() + theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=.5)) + ggtitle("Both below thresh: stat")
+
+ks <- lapply(r,function(thr){
+  yy <- y[n_est.1>thr|n_est.2>thr,value]
+  if(length(yy)){
+    return(suppressWarnings(ks.test(yy,z,alternative = "l")))
+  } else {
+    return(NULL)
+  }
+})
+names(ks) <- r
+ks <- ks[!sapply(ks, is.null)]
+ks <- data.table(names(ks),sapply(ks, "[[","p.value"),sapply(ks, "[[","statistic"))
+
+ggplot(ks) + aes(x=factor(V1),y=-log10(V2)) + geom_col() + theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=.5)) + ggtitle("Either below thresh: p.val")
+ggplot(ks) + aes(x=factor(V1),y=V3) + geom_col() + theme(axis.text.x = element_text(angle = 90,hjust=1,vjust=.5)) + ggtitle("Either below thresh: stat")
+```
+
+
+```{r 'distance.1st_nth'}
+pat.subset <- detect$sWG$meta[Sample.type == "ctDNA" & detect$ichorCNA.default$summary$n_est!=1,.N,Patient.ID][N>4,Patient.ID]
+x <- rbindlist(lapply(pat.subset,function(p.ID){
+  
+  i <- which(detect$sWG$meta[,Patient.ID == p.ID & Sample.type == "ctDNA"] & detect$ichorCNA.default$summary$n_est!=1 )
+  x <- cbind(detect$sWG$meta[i],detect$ichorCNA.default$summary[i,.(n_est)])
+  x$dist.1st <- detect$dist.matrix[i,i[which.min(x$Date.collected)]]
+  x$dist.nth <- detect$dist.matrix[i,i[which.max(x$Date.collected)]]
+  
+  if("PT" %in% detect$sWG$meta[Patient.ID==p.ID,Sample.type]){
+    j <- which(detect$sWG$meta[,Patient.ID == p.ID & Sample.type == "PT"] & detect$ichorCNA.default$summary$n_est!=1 )
+    j <- j[ detect$sWG$meta[j][,.I[which.max(aligned.reads)],Patient.ID][,V1]]
+    x$dist.PT <- detect$dist.matrix[i,j]
+  } else {
+    x$dist.PT <- NA*length(i)
+  }
+  
+  if("MT" %in% detect$sWG$meta[Patient.ID==p.ID,Sample.type]){
+    j <- which(detect$sWG$meta[,Patient.ID == p.ID & Sample.type == "MT"] & detect$ichorCNA.default$summary$n_est!=1 )
+    j <- j[ detect$sWG$meta[j][,.I[which.max(aligned.reads)],Patient.ID][,V1]]
+    x$dist.MT <- detect$dist.matrix[i,j]
+  } else {
+    x$dist.MT <- NA*length(i)
+  }
+  
+  return(x)
+}))
+
+x[,Date.relative:=Date.collected-min(Date.collected),Patient.ID]
+x <- melt(x,id.vars = c("Patient.ID","Date.relative","n_est"), measure.vars=c("dist.1st","dist.nth","dist.PT","dist.MT"))
+x[,direct:=factor(ifelse(variable %in% c("dist.1st","dist.PT"),1,-1))]
+x$Patient.ID <- factor(x$Patient.ID)
+x[,direct:=factor(ifelse(variable %in% c("dist.1st","dist.PT"),1,-1),levels=c(1,-1))]
+
+#summary(x[variable=="dist.1st" & value!=1,lm( (value-1) ~ 0 + Date.relative)])
+#summary(x[variable=="dist.nth"  & value!=1,.(value,Date.relative - max(Date.relative)),Patient.ID][,lm( (value-1) ~ 0 + V2)])
+
+results[["distance.1st_nth"]] <- list(
+  data = x,
+  m.1 = x[variable=="dist.1st",lm( (value-1) ~ 0 + Date.relative + Patient.ID:Date.relative)],
+  m.n = x[variable=="dist.nth",.(value,Date.relative - max(Date.relative)),Patient.ID][,lm( (value-1) ~ 0 + V2 + Patient.ID:V2)]
+)
+```
+
+```{r metabric.drivers}
+mut.driver.genes <-jsonlite::fromJSON(paste0(project.dir,"data/PBCP_geneTierList_March2019.json"))$TIER1
+mut.driver.genes <- mapIds(org.Hs.eg.db,keys=mut.driver.genes,column="ENTREZID",keytype = "ALIAS")
+
+Tx.Db <- keepStandardChromosomes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+Tx.genes <- genes(Tx.Db)
+Tx.genes <- Tx.genes[Tx.genes$gene_id %in% mut.driver.genes]
+seqlevels(Tx.genes) <- gsub("chr","",seqlevels(Tx.genes))
+Tx.genes <- Tx.genes[order(Tx.genes)] 
+Tx.genes$gene_id <- names(mut.driver.genes)[match(Tx.genes$gene_id,mut.driver.genes)]
+
+ctDNA.models <- process.segs(detect$ichorCNA.default$bestModels$raw[get.detect.best_ctDNA_index(detect)])
+
+copy.number <- list()
+copy.number$detect <- rbindlist(lapply(ctDNA.models$raw, function(x){
+  segs <- makeGRangesFromDataFrame(x,keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$detect[,AKT1:=NULL]
+
+copy.number$metabric <- rbindlist(lapply(metabric$segs$raw, function(x){
+  segs <- makeGRangesFromDataFrame(x,keep.extra.columns = T)
+  y <- segs$copy.number[findOverlaps(Tx.genes, segs,type="within",select = "first")]
+  names(y) <- Tx.genes$gene_id
+  as.list(y)
+}),idcol = "Sample.name")
+copy.number$metabric[,AKT1:=NULL]
+
+x <- rbindlist(copy.number,idcol = "study")
+x <- cbind(
+  "gene"=rep(names(x)[-(1:2)],4),
+  rbind(
+    x[,-2][,apply(.SD,2,function(x) mean(x>2,na.rm=T)),study][,.(study,CN="Gain","frac"=V1)],
+    x[,-2][,apply(.SD,2,function(x) mean(x<2,na.rm=T)),study][,.(study,CN="Loss","frac"=-V1)]
+  ),
+  "p.val"=c(
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] > 2), table(copy.number$metabric[,i,with=F] > 2)))$p.val
+    })),2),
+    rep(p.adjust(sapply(2:(ncol(copy.number$detect)), function(i){
+      fisher.test(rbind(table(copy.number$detect[,i,with=F] < 2), table(copy.number$metabric[,i,with=F] < 2)))$p.val
+    })),2)
+  )
+)
+
+results[["metabric.drivers"]] <- x
+```
+
+```{r metabric.gwas}
+ctDNA.models <- process.segs(detect$ichorCNA.default$bestModels$raw[get.detect.best_ctDNA_index(detect)])
+
+x <- get.gl.counts(ctDNA.models$expanded)
+y <- get.gl.counts(metabric$segs$expanded)
+x <- merge(x,y,by=c("chr","start"))
+
+x[,p.val.l:=fisher.test(matrix(c(V1.x,V3.x,V1.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.loss <- p.adjust(x$p.val.l,method="fdr")
+
+x[,p.val.g:=fisher.test(matrix(c(V2.x,V3.x,V2.y,V3.y),2,2))$p.val,.(chr,start)]
+x$adj.p.val.gain <- p.adjust(x$p.val.g,method="fdr")
+
+results[["metabric.gwas"]] <- x
+```
+
+# Abstract
+
+# Introduction
+
+# Methods
+
+# Results
+
+# Discussion
+
+# Conclusion
+
+\clearpage
+
+# Tables
+
+```{r overview.clinical.table, include=T, results="asis"}
+x <- list(
+  "Age at primary diagnosis" = detect$clinical[,.N,.(value=cut(as.numeric(as.Date(pbc_diagnosed_date) - as.Date(birth_date))/365,c(0,40,50,60,70,120)))][order(value)],
+  "Race" = detect$clinical[,.N,.(value=ifelse(grepl("White",ethnicity),"White",ifelse(ethnicity=="Not Stated","Unknown","Nonwhite")))],
+  "Primary receptor status" =detect$clinical[,.N,.(pbc_er_status, pbc_her2_status)][,.(ifelse("Not Known" %in% c(pbc_er_status,pbc_her2_status),"Indeterminate",paste0("ER ",pbc_er_status,", HER2 ",pbc_her2_status)),N),.(N)][,.(N=sum(N)),.(value=V1)],
+  "Grade at primary diagnosis"=detect$clinical[,.(roman=as.roman(as.numeric(pbc_grade)))][,.N,.(value=ifelse(is.na(roman),"Unknown",as.character(roman)))][order(value)],
+  "Vital status" = detect$clinical[,.N,.(value=ifelse(is.na(death_date),"Alive","Deceased"))][order(value)]
+)
+x <- rbindlist(x,idcol = "Measure")
+x[!(c(T,tail(Measure,-1)!=head(Measure,-1))),Measure:=""]
+#print(xtable::xtable(x),include.rownames = F) <-- Latex
+knitr::kable(x)
+```
+
+```{r survival.AG.all.table, include=T, results="asis"}
+models <- results$survival.AG.all$m.ind
+m.combined <- results$survival.AG.all$m.com
+
+stargazer(models,m.combined,title="Measure Comparison",
+          dep.var.labels="Progression Free Survival",model.numbers = F,
+          add.lines=list(
+            c("AIC",signif(sapply(models,AIC),4),signif(AIC(m.combined),4)),
+            c("Concordance",signif(sapply(lapply(models,concordance),"[[",1),3),signif(concordance(m.combined)[[1]],3))
+            ),
+          omit.stat=c("max.rsq","n"),
+          header=F,
+          df = F,
+          dep.var.caption="Time Dependent Cox Model",
+          type="html"
+          )
+```
+
+\clearpage
+
+# Figures
+
+```{r survival.cox.ichor.cut.plot, out.width='50%', fig.show='hold', fig.cap='Cox propotional hazard models based on ichorCNA as a predictor'}
+ggsurvplot(results$survival.cox.ichor$m.10, results$survival.cox.ichor$data, risk.table = 2, conf.int = F,pval=T,ggtheme = theme_tufte(25),legend.labs=c("<10%","\u226510%"),xlim=c(0,365),break.x.by=60,legend.title="ichorCNA",xlab="Days",ylab="Progression Free\nSurvival Probability",tables.theme = theme_cleantable())
+
+ggsurvplot(results$survival.cox.ichor$m.0, results$survival.cox.ichor$data, risk.table = 2, conf.int = F,pval=T,ggtheme = theme_tufte(25),legend.labs=c("=0%",">0%"),xlim=c(0,365),break.x.by=60,legend.title="ichorCNA",xlab="Days",ylab="Progression Free\nSurvival Probability",tables.theme = theme_cleantable())
+```
+
+```{r survival.AG.ichor.cont.plot, fig.cap='Time-dependent Cox regression using ichorCNA as a predictor'}
+new.dat <- data.table(tumour.frac=(0:6)/10)
+pred <- survfit(results$survival.AG.ichor.cont$m, newdata = new.dat)
+ggsurvplot(pred, conf.int = F,ggtheme = theme_tufte(25),legend.labs=new.dat$tumour.frac*100,data=new.dat,xlim=c(0,365),break.x.by=60,xlab="Days",legend.title="ichorCNA\nTum. Frac.",ylab="Progression Free\nSurvival Probability",palette=colorRampPalette(c("skyblue", "salmon"))(7))
+```
+
+```{r survival.AG.ichor.cut.plot, fig.cap='Optimal thresholding of a time-dependent Cox regression using ichorCNA as a predictor'}
+new.dat <- data.table(tumour.frac=c(0,results$survival.AG.ichor.cut$opt.cut+0.01))
+pred <- survfit(results$survival.AG.ichor.cut$m, newdata = new.dat)
+ggsurvplot(pred, conf.int = F,ggtheme = theme_tufte(20),legend.labs=c("<7%","\u22657%"),data=new.dat,xlim=c(0,365),break.x.by=60,xlab="Days",legend.title="ichorCNA TF",ylab="Progression Free\nSurvival Probability")
+```
+
+```{r boundaries.overview.plot, fig.cap='Overview of treatment boundaries within DETECT Her2+ve cohort'}
+time.limit <- 6*28 #same N as 365
+m.terms <- c("post.CT","post.score","patient.id")
+m.terms <- c(m.terms, paste0(m.terms,".date"))
+
+treat.bound <- get.treat.bound.preprocess(detect,20,F,m.terms,time.limit)
+
+treat.bound[,bound.ID:=paste(patient.id,1:.N,sep=":"),patient.id]
+treat.bound[,bound.ID:=factor(bound.ID,levels = bound.ID)]
+treat.bound[,post.CT:=factor(ifelse(post.CT=="PD","PD","!PD"),levels =  c("CT Scan","PD","!PD"," ","Plasma Sample","High risk","Low risk"))]
+treat.bound[,post.score:=factor(ifelse(post.score>.06,"High risk","Low risk"),levels =  c("CT Scan","PD","!PD"," ","Plasma Sample","High risk","Low risk"))]
+treat.bound[,post.date:=max(post.CT.date,post.score.date),bound.ID]
+
+(p <- ggplot(treat.bound) + aes(x=bound.ID) +
+    geom_linerange(aes(ymin=0,ymax=post.date),size=1.5,colour="grey80") +
+    geom_point(aes(y=post.CT.date,colour=post.CT,shape=post.CT),size=2) +
+    geom_point(aes(y=post.score.date,colour=post.score,shape=post.score),size=2) +  
+    geom_hline(yintercept = 0,linetype="dashed") + 
+    geom_hline(yintercept = 21,linetype="dashed",colour="grey80") + 
+    labs(x="",y="Date from Treatment Boundary") + theme_tufte(18) + coord_flip() +  scale_colour_manual(values=c("CT Scan"="white","PD"="salmon","!PD"="skyblue"," "="white","Plasma Sample"="white","High risk"="salmon","Low risk"="skyblue"),drop=F) + scale_shape_manual(values=c("CT Scan"=17,"PD"=17,"!PD"=17," "=17,"Plasma Sample"=15,"High risk"=15,"Low risk"=15),drop=F) + theme(legend.title = element_blank()))
+```
+
+```{r distance.1st_nth.plot}
+leg.labs <- c("1st ctDNA sample", "Last ctDNA sample","Primary biopsy","Metastatic Biopsy")
+leg.cols <- c("salmon","salmon","skyblue","skyblue")
+
+ggplot(results[["distance.1st_nth"]]$data) + aes(x=as.numeric(Date.relative),y=value,colour=variable,group=variable,linetype=direct,label=ifelse((1-n_est)>0.1,"T","F")) +
+  geom_line() + geom_point() + facet_wrap(~Patient.ID,scale="free_x",nrow=2) +
+  theme_bw(20) + labs(y="Correlation",x="Days") + theme(panel.grid=element_blank(),legend.position = "top") +
+  scale_color_manual(name="Cor. calc. w.r.t.",labels=leg.labs,values=leg.cols) +
+  scale_linetype(guide = FALSE) + 
+  guides(colour = guide_legend(override.aes = list(color=leg.cols,linetype = c(1,3,1,3)),nrow=2,byrow=TRUE))
+```
+
+```{r casestudy.circus.plot}
+p.ID <- 81
+i <- detect$sWG$meta[,which(Patient.ID == p.ID & Sample.type!="BC")]
+i <- i[detect$sWG$meta[i][,order(factor(Sample.type,levels=c("BC","PT","ctDNA","MT")),Sample.num)]]
+segs <- detect$ichorCNA.default$bestModels$raw[i]
+n_est <- detect$ichorCNA.default$summary[i]$n_est
+names(segs) <- detect$sWG$meta[i,paste0(Patient.ID,":",ifelse(!is.na(Sample.num),Sample.num,Sample.type)," (",signif(1-n_est,3)*100,"%)")]
+circus.plot(segs)
+```
+
+```{r casestudy.timeline.plot}
+p.ID <- 81
+getPalette <- colorRampPalette(brewer.pal(12, "Set3"))
+
+x <- cbind(detect$sWG$meta,detect$ichorCNA.default$summary)
+x <- x[Sample.type=="ctDNA" & Patient.ID == p.ID,.(ichorCNA.Tumour.Frac=(1-n_est)*100),.(Patient.ID,scan.id=Sample.num,date=Date.collected)]
+x <- x[!is.na(date)]
+
+#Get relevant treatment data
+y <- detect$treatment[Patient.ID == p.ID,.(Patient.ID,date.start=start.date,date.end=end.date,treatment)]
+y <- y[date.start<x[,max(date)]]
+y <- y[treatment!="OFF"]
+y <- y[is.na(date.end) | date.end>x[,max(date)],date.end:=x[,max(date)]]
+
+#Get the CT Recist calls (Emma)
+z <- detect$RECIST[Patient.ID ==p.ID,.(date=as.Date(date,"%d/%m/%Y"),RECIST,Patient.ID)]
+z <- z[date<x[,max(date)]]
+z[RECIST=="NMD",RECIST:="NM"]
+
+y.max <- max(x[Patient.ID==p.ID,ichorCNA.Tumour.Frac])
+if(y.max == 0) y.max <- 0.1
+
+p <- ggplot()
+  
+if(nrow(y)){
+  if(nrow(y[date.start!=date.end])){
+    y.sub <- y[date.start!=date.end]
+    y.sub$treatment <- factor(y.sub$treatment,levels = unique(y.sub$treatment))
+    colourCount = length(levels(y.sub$treatment))
+    p <- p + 
+      geom_rect(data=y.sub,aes(xmin=date.start,xmax=date.end, ymin = -Inf, ymax = Inf,fill = treatment),alpha=0.5) +
+        scale_fill_manual(values=getPalette(colourCount),name="Treatment")
+  }
+  if(nrow(y[date.start==date.end])){
+    y.sub <- y[date.start==date.end]
+    p <- p + geom_vline(data=y.sub,aes(xintercept=date.start,linetype=treatment)) +
+      scale_linetype_manual(values=c("twodash", "dotted","longdash"),name="One Day\nTreatment")
+  }
+}
+  
+p <- p +
+  geom_line(data=x,aes(x=date,y=ichorCNA.Tumour.Frac)) +
+  geom_label(data=x,aes(x=date,y=ichorCNA.Tumour.Frac,label=scan.id)) +
+  ylim(0,y.max)  +
+  labs(title=" ",tag=paste("Patient:",p.ID)) +
+  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+if(z[,.N]){ 
+  for(i in 1:nrow(z)){
+    ds <- z[i,date]
+    R <- z[i,RECIST]
+    p <- p + 
+      annotation_custom(segmentsGrob(gp = gpar(col = "black", lwd = 2)),xmin=ds,xmax=ds,ymin=y.max+(0.02*y.max),ymax=y.max+(0.06*y.max)) +
+      annotation_custom(textGrob(R, gp = gpar(col = "black"),rot=-90,hjust=2),xmin=ds,xmax=ds,ymin=y.max,ymax=y.max)
+  }
+}
+
+g <- ggplotGrob(p)
+g$layout$clip[g$layout$name=="panel"] <- "off"
+
+grid.newpage()
+grid.draw(g)
+```
+
+
+```{r 'metabric.overview.plot'}
+ctDNA.models <- process.segs(detect$ichorCNA.default$bestModels$raw[get.detect.best_ctDNA_index(detect)])
+chr.max <- ctDNA.models$agg.reduced$gain[,max(end),chr]
+chr.min <- ctDNA.models$agg.reduced$gain[,min(start),chr]
+
+metabric.trimed_segs <- trim.segmentation(metabric$segs,chr.max,chr.min) 
+                                                         
+segs.agg.reduced <- list(
+  gain = rbind(
+    cbind(
+      ctDNA.models$agg.reduced$gain,
+      "sample.type"=paste0("ctDNA (",length(ctDNA.models$raw),")")
+    ),
+    cbind(
+      metabric.trimed_segs$agg.reduced$gain,
+      "sample.type"=paste0("METABRIC (",length(metabric.trimed_segs$raw),")")
+    )
+  ),
+  loss = rbind(
+    cbind(
+      ctDNA.models$agg.reduced$loss,
+      "sample.type"=paste0("ctDNA (",length(ctDNA.models$raw),")")
+    ),
+    cbind(
+      metabric.trimed_segs$agg.reduced$loss,
+      "sample.type"=paste0("METABRIC (",length(metabric$segs$raw),")")
+    )
+  )
+)
+
+segs.agg.reduced$gain$chr <- factor(segs.agg.reduced$gain$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss$chr <- factor(segs.agg.reduced$loss$chr,levels = c(1:22,"X"))
+segs.agg.reduced$loss[,V1:=-V1]
+
+ggplot() + aes(xmin=start,xmax=end,ymin=0,ymax=V1) + 
+  geom_rect(fill="palevioletred",data=segs.agg.reduced$gain) + 
+  geom_rect(fill="lightskyblue",data=segs.agg.reduced$loss) +
+  ylim(-1,1) + facet_grid(sample.type~chr,space = "free_x",scales = "free_x") +
+  theme_bw() + theme(axis.text.x = element_blank(),axis.ticks.x = element_blank(),strip.background = element_blank(),panel.spacing.x = unit(0,"cm"),legend.position="none",panel.grid = element_blank())
+```
+
+```{r metabric.drivers.plot}
+x <- results[["metabric.drivers"]]
+y <- x[p.val<0.01 & CN=="Gain",.(CN,study="detect",frac=max(frac)),gene]
+z <- x[p.val<0.01 & CN=="Loss",.(CN,study="detect",frac=min(frac)),gene]
+
+ggplot(x) + aes(x=gene,y=frac,fill=study) + geom_col(position="dodge") + facet_grid(CN~.,scales="free") +
+  theme_bw(20) + theme(panel.grid = element_blank(),axis.text.x = element_text(angle=90,hjust=1,vjust=0.5),legend.position = "top",panel.grid.major.y  = element_line(colour = "grey60",size=0.1,linetype = "dashed")) +
+  scale_y_continuous(labels = scales::percent) + labs(x="",y="") +
+  scale_fill_discrete(name="",labels=c("Detect","Metabric")) + 
+  geom_text(data=y,label="*",size=5) + geom_text(data=z,label="*",nudge_y = -0.04,size=5)
+```
+
+
+```{r metabric.gwas.plot}
+p.val.thresh <- 1E-6
+x <- results[["metabric.gwas"]]
+x$chr <- factor(x$chr,levels = c(1:22,"X"))
+x <- x[order(chr,start)]
+x[,index:=.I]
+odd.chr <- levels(x$chr)[(seq_along(levels(x$chr)) %% 2) == 1]
+x[,chr.alt:=chr %in% odd.chr]
+xbreaks <- x[,floor(median(index)),chr]
+
+y <- melt(x,id.vars = c("chr","start","index","chr.alt"),measure.vars = c("adj.p.val.gain","adj.p.val.loss"))
+
+y[,value:=-log10(value)]
+y[variable=="adj.p.val.loss",value:=-value]
+levels(y$variable) <- c("Gain","Loss")
+
+scale.pad <- y[,.(chr.alt=TRUE,index=1,variable=unique(variable),value=max(abs(value)))]
+scale.pad[variable=="Loss",value:=-value]
+
+y.breaks <- seq(-ceiling(scale.pad$value[1]),ceiling(scale.pad$value[1]))
+
+loss.labels <- y[variable=="Loss",.SD[which.min(value)],chr][value<log10(p.val.thresh)]
+gain.labels <- y[variable=="Gain",.SD[which.max(value)],chr][value>-log10(p.val.thresh)]
+
+cytobands <- fread(paste0(project.dir,"data/cytoBand.txt"))
+cytobands[,chr:=gsub("chr","",V1)]
+cytobands[,band:=paste0(chr,tstrsplit(V4,"\\.")[[1]])]
+gain.labels$cytoband <- cytobands[gain.labels[,which((chr == cytobands$chr) & (start > cytobands$V2) & (start < cytobands$V3)),chr][,V1],band]
+loss.labels$cytoband <- cytobands[loss.labels[,which((chr == cytobands$chr) & (start > cytobands$V2) & (start < cytobands$V3)),chr][,V1],band]
+
+ggplot(y) + aes(x=index,y=value,colour=as.factor(chr.alt)) + geom_point() + geom_point(data=y[abs(value)>-log10(p.val.thresh)],colour="firebrick") +
+    geom_label(data=loss.labels,aes(label=cytoband),colour="black",nudge_y = -.3,nudge_x = 50) + geom_label(data=gain.labels,aes(label=cytoband),colour="black",nudge_y = .3,nudge_x = 50) + 
+    geom_blank(data=scale.pad) + scale_x_continuous(name = "",breaks = xbreaks$V1, labels = xbreaks$chr,expand = c(0,0)) + scale_color_grey() + scale_y_continuous(name="-log10(adj.p.val)",breaks=y.breaks,labels = as.character(abs(y.breaks))) + theme_bw() + theme(panel.grid = element_blank(),legend.position = "none") + facet_grid(variable~.,scales = "free_y")
+```

@@ -1,0 +1,103 @@
+---
+title: "Measuring tumour dynamics via sWG sequencing of ctDNA - genelist"
+author: "Alistair Martin"
+date: "7 July 2017"
+output: html_notebook
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+library(ggplot2)
+library(ggthemes)
+library(biomaRt)
+library(pheatmap)
+theme_set(theme_bw())
+
+source("src/load.sWG.R")
+data <- load.sWG.data()
+data$cns <- cbind(data$cns[,1:4,with=F],apply(data$cns[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+data$segments <- cbind(data$segments[,1:4,with=F],apply(data$segments[,-(1:4)],2,function(x){x[x < -3] <- -3; x}))
+
+cosmic <- fread("data/Census_allTue Aug  1 16-03-55 2017.csv",check.names = T)
+cosmic[,c("chromosome_name","Genome.Location"):=tstrsplit(Genome.Location,":")]
+cosmic[,c("start_position","end_position"):=tstrsplit(Genome.Location,"-")]
+cosmic <- cosmic[grepl("breast",Tumour.Types.Germline.,ignore.case = T) | grepl("breast",Tumour.Types.Somatic.,ignore.case = T)]
+cosmic <- cosmic[order(as.integer(chromosome_name),as.integer(start_position))]
+
+ensembl <- useMart("ensembl",dataset="hsapiens_gene_ensembl")
+ensembl <- getBM(attributes=c("ensembl_gene_id","hgnc_symbol","chromosome_name","start_position","end_position"),mart=ensembl)
+
+caldas.genes <- rbind(fread("data/bp-ts-mutdriver.txt",header = F),fread("data/ldma-autopsy.txt",header=F))
+caldas.genes[caldas.genes$V1 == "MLLT4"]$V1 <- "AFDN"
+caldas.genes[caldas.genes$V1 == "MLL2"]$V1 <- "KMT2D"
+caldas.genes[caldas.genes$V1 == "MLL3"]$V1 <- "KMT2C"
+caldas.genes <- unique(caldas.genes)
+caldas.genes <- as.data.table(getBM(attributes=c("hgnc_symbol","chromosome_name","start_position","end_position"),filter=c("hgnc_symbol"),values = caldas.genes$V1, mart=ensembl))
+caldas.genes <- caldas.genes[chromosome_name %in% c(as.character(1:22),"X","Y")]
+caldas.genes <- caldas.genes[order(factor(chromosome_name,levels=c(as.character(1:22),"X","Y")),as.integer(start_position))]
+```
+
+```{r}
+i <- data$meta[,which(type=="BC")]
+z.func <- function(gene){
+  gene <- as.list(gene)
+  j <- data$cns[,which(chromosome == gene$chromosome_name & start < as.integer(gene$end_position) & end > as.integer(gene$start_position))]
+  x  <- colSums(data$cns[j,-(1:4),with=F])
+  s <- sd(x[i],na.rm=T)
+  u  <- mean(x[i])
+  z <- (x-u)/s
+  z
+}
+
+z.cosmic <- t(apply(cosmic,1,z.func))
+rownames(z.cosmic) <- cosmic$Gene.Symbol
+z.cosmic <- z.cosmic[rowSums(!is.na(z.cosmic))!=0,]
+
+z.caldas <- t(apply(caldas.genes,1,z.func))
+rownames(z.caldas) <- caldas.genes$hgnc_symbol
+z.caldas <- z.caldas[rowSums(!is.na(z.caldas))!=0,]
+```
+
+```{r, fig.height=6}
+z.score.threshold <- 3.09 #0.001
+for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient == pat & type=="plasma" & !is.na(cycle))]
+  i <- i[ data$meta[i,order(total.days)] ]
+  
+  j <- data$meta[,which(patient == pat & type=="FFPE" & prior.post=="primary")]
+  i <- c(j,i)
+  
+  z.cosmic.subset <- z.cosmic[,i]
+  colnames(z.cosmic.subset) <- data$meta[i,Sample.name]
+  
+  z.cosmic.subset[which(abs(z.cosmic.subset) <= z.score.threshold,arr.ind = T)] <- 0
+  z.cosmic.subset[which(z.cosmic.subset < -z.score.threshold,arr.ind = T)] <- -1
+  z.cosmic.subset[which(z.cosmic.subset > z.score.threshold,arr.ind = T)] <- 1
+  
+  #z.cosmic.subset <- z.cosmic.subset[ rowSums(abs(z.cosmic.subset) > 1.64) > 0, ]
+  
+  pheatmap(z.cosmic.subset,color = c("lightskyblue","black","palevioletred"),breaks=c(-2,-.5,.5,2),legend=F,cluster_cols = F, cluster_rows = F,cellwidth = 10,cellheight = 10,gaps_col = length(j),main=paste("Patient",as.character(pat)))
+}
+```
+
+```{r,fig.width=17}
+z.score.threshold <- 3.09 #0.001
+for(pat in data$meta[,sort(unique(patient))]){
+  i <- data$meta[,which(patient == pat & type=="plasma" & !is.na(cycle))]
+  i <- i[ data$meta[i,order(total.days)] ]
+  
+  j <- data$meta[,which(patient == pat & type=="FFPE" & prior.post=="primary")]
+  i <- c(j,i)
+  
+  z.caldas.subset <- z.caldas[,i]
+  colnames(z.caldas.subset) <- data$meta[i,Sample.name]
+  
+  z.caldas.subset[which(abs(z.caldas.subset) <= z.score.threshold,arr.ind = T)] <- 0
+  z.caldas.subset[which(z.caldas.subset < -z.score.threshold,arr.ind = T)] <- -1
+  z.caldas.subset[which(z.caldas.subset > z.score.threshold,arr.ind = T)] <- 1
+  
+  #z.caldas.subset <- z.caldas.subset[ rowSums(abs(z.caldas.subset) > 1.64) > 0, ]
+  
+  pheatmap(t(z.caldas.subset),color = c("lightskyblue","black","palevioletred"),breaks=c(-2,-.5,.5,2),legend=F,cluster_cols = F, cluster_rows = F,cellwidth = 10,cellheight = 10,gaps_row = length(j),gaps_col = caldas.genes[,which(head(chromosome_name,-1)!=tail(chromosome_name,-1))], main=paste("Patient",as.character(pat)))
+}
+```

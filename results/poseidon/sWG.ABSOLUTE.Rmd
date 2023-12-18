@@ -1,0 +1,141 @@
+---
+title: "ctDNA-sWG Absolute Analysis"
+output: html_notebook
+---
+
+#Data processing
+
+Load the sWG data and the neccesary libraries for the below analysis.
+
+```{r "setup",warnings=F}
+root.dir <- "~/OneDrive/projects/"
+project.dir <- paste0(root.dir,"ctDNA/")
+opts_knit$set(root.dir = project.dir)
+
+suppressWarnings(library(data.table))
+library(ABSOLUTE)
+library(ggplot2)
+library(ggthemes)
+library(knitr)
+source(paste0(project.dir,"src/load.poseidon.R"))
+source(paste0(project.dir,"src/load.absolute.R"))
+
+data <- poseidon.load.data(project.dir)
+```
+
+Run absolute on each of the samples. Note that it checks whether the output files are already present, and if so, it does not run for that sample. The file must be deleted for absolute to run again.
+
+```{r,echo=F}
+run.abs <- function(x,sample.name='unknown.sample'){
+  genome <- "hg18"
+  platform <- "Illumina_WES"
+  primary.disease <- 'CANCER'
+  sigma.p <- 0
+  max.sigma.h <- 0.02
+  min.ploidy <- 0.95
+  max.ploidy <- 10
+  max.as.seg.count <- 1E10
+  max.non.clonal <- 100
+  max.neg.genome <- 0
+  copy_num_type <- "total"
+  results.dir <- 'ABSOLUTE/indv'
+  tmp.fname <- tempfile()
+  
+  write.table(x,file=tmp.fname,quote=F,row.names=F,sep='\t')
+  RunAbsolute(tmp.fname, sigma.p, max.sigma.h, min.ploidy, max.ploidy, primary.disease, 
+                platform, sample.name, results.dir, max.as.seg.count, max.non.clonal, 
+                max.neg.genome, copy_num_type, verbose=TRUE)
+}
+
+dir.create('ABSOLUTE',showWarnings=F)
+for(i in 1:nrow(data$meta)){
+  j <- i + 4
+  stopifnot( names(data$cns)[j] == data$meta[i,fname] )
+  if( !file.exists(paste0('ABSOLUTE/indv/',gsub('/','-',data$meta[i,Sample.name]),'.ABSOLUTE.RData')) ) {
+  
+    x <- data$segments[,c(2:4,j),with=F]
+    names(x) <- c("Chromosome","Start","End","Segment_Mean")
+    x$grp <- x[,c(1,which(diff(Segment_Mean)!=0)+1,.N+1),Chromosome][,rep(1:length(diff(V1)), diff(V1)),Chromosome][,V1]
+    x <- x[,.(Start=min(Start),End=max(End),Segment_Mean=unique(Segment_Mean),Num_Probes=.N),.(Chromosome,grp)][,-c('grp')]
+    levels(x$Chromosome)[23] <- "23"
+    
+    invisible(run.abs(x,gsub('/','-',data$meta[i,Sample.name])))
+  }
+}
+```
+
+The next two chunks compiles the absolute results, taking the highest rated model by their combined score for each sample. This behaviour can be changed by specifying different models between the execution of the two chunks (see absolute docs for details).
+
+```{r}
+CreateReviewObject('reviews',dir('ABSOLUTE/indv','*.ABSOLUTE.RData',full.names=T),'ABSOLUTE/reviews/','total',verbose=TRUE)
+```
+
+```{r}
+ExtractReviewedResults('ABSOLUTE/reviews/reviews.PP-calls_tab.txt','martin06','ABSOLUTE/reviews/reviews.PP-modes.data.RData','ABSOLUTE','summary','total',verbose=TRUE)
+```
+
+This loads the output of absolute, specifically the meta data for each sample (ploidy + purity notably) and the corrected segmentation. Note that not all samples processed by absolute are succesfull; roughly 33% fail as their segmentation did not contain enough information to infer the ploidy and purity. Once loaded, we merge the data associated with each patient together and then mark regions with gains and losses using the COSMIC definition, which is notably strict in its assignment.
+
+http://cancer.sanger.ac.uk/cosmic/help/cnv/overview
+
+```{r}
+absolute <- load.absolute.data(project.dir,data$meta)
+```
+
+```{r}
+theme_sWG <- theme_tufte() + theme(
+  axis.ticks.x=element_blank(),
+  axis.text.x=element_blank(),
+  panel.spacing.x=unit(0, "lines"),
+  panel.border=element_rect(color="grey80",fill=NA,size=1,linetype="solid"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  strip.text.y = element_text(size=6),
+  plot.title = element_text(hjust = 0.5)
+  )
+
+for(i in 1:length(absolute$patients)){
+  x <- absolute$patients[[i]][,.(seq(Start.bp,signif(End.bp,4),10000),seq(Start.bp-1,signif(End.bp,4),10000)[-1],modal_cn,ploidy,gain,loss),.(sample,Chromosome,Start.bp)][,.(sample,Chromosome,Start.bp=V1,End.bp=V2,modal_cn,ploidy,gain,loss)]
+  x<- x[,.(gains=sum(gain)/.N,losses=sum(loss)/.N),.(Chromosome,Start.bp)][,.(CNA=if(gains>0){gains}else{-losses}),.(Chromosome,Start.bp)]
+  x <- x[order(Chromosome,Start.bp)]
+  x$grp <- x[,c(1,which(diff(CNA)!=0)+1,.N+1),Chromosome][,rep(1:length(diff(V1)), diff(V1)),Chromosome][,V1]
+  
+  p <- ggplot(x) + 
+    aes(x=Start.bp,y=100*CNA,group=grp,size=2,colour=cut(CNA,c(-101,-0.01,0.01,101))) + 
+    geom_line() +
+    ylim(-100,100) +
+    facet_grid(~Chromosome,scales = "free_x") +
+    theme_sWG + 
+    xlab("Chromosome") + 
+    ylab("Fraction gains/losses") +
+    ggtitle(paste("Patient:",names(absolute$patients)[i])) + 
+    scale_colour_manual(values=c("deepskyblue2","black","palevioletred2"),breaks=c("(-101,-0.01]","(-0.01,0.01]","(0.01,101]"),drop=F) +
+    theme(legend.position="none")
+  print(p)
+}
+```
+
+```{r}
+for(i in 1:length(absolute$patients)){
+  x <- absolute$patients[[i]][,.(seq(Start.bp,signif(End.bp,4),10000),seq(Start.bp-1,signif(End.bp,4),10000)[-1],modal_cn,ploidy,gain,loss),.(sample,Chromosome,Start.bp)][,.(sample,Chromosome,Start.bp=V1,End.bp=V2,modal_cn,ploidy,gain,loss)]
+  
+  x$total.days <- data$meta[match(x[,sample],data$meta[,Sample.name]),total.days]
+  x[,total.days:=total.days+0.01*(as.numeric(factor(sample))-1),total.days]
+  x[,total.days:=factor(total.days)]
+  levels(x$total.days) <- x[,unique(sample)[1],total.days][order(total.days),V1]
+  
+  p <- ggplot(x) + 
+    aes(x=Start.bp,y=total.days,fill=interaction(loss,gain)) + 
+    geom_tile() +
+    facet_grid(~Chromosome,scales = "free_x") +
+    theme_sWG + 
+    xlab("Chromosome") + 
+    ylab("Fraction gains/losses") +
+    ggtitle(paste("Patient:",names(absolute$patients)[i])) + 
+    scale_fill_manual(values=c("white","deepskyblue2","palevioletred2","black"),breaks=c("FALSE.FALSE","TRUE.FALSE" ,"FALSE.TRUE" ,"TRUE.TRUE"),drop=F) +
+    theme(legend.position="none")
+  print(p)
+}
+```
+
